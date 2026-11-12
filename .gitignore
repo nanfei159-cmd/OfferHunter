@@ -1,0 +1,65 @@
+# Java / Gradle
+.gradle/
+build/
+target/
+*.log
+hs_err_pid*
+
+# Frontend build outputs
+front/node_modules/
+front/.next/
+front/out/
+src/main/resources/dist/
+
+# Desktop app dependencies and packaged outputs
+desktop/node_modules/
+desktop/release/
+desktop/release-*/
+desktop/*.exe
+
+# Runtime data / local browser profile
+db/*.db
+db/*.db-wal
+db/*.db-shm
+browser-data/
+backend.log
+
+# Release artifacts
+dist/
+release/
+release-*/
+
+# Local design drafts, screenshots, scratch data
+ui-*.png
+sidebar-crop.png
+splash-preview.png
+name-options.*
+icon-sizes*.png
+exe-icon.png
+all-dq.json
+liepin-city-click.png
+liepin-search.html
+liepin-citylist.html
+
+# Upstream docs/assets for removed platforms
+doc/
+GetJobs 操作手册.html
+src/main/resources/images/
+src/main/resources/xpathHelper.crx
+src/main/resources/img.png
+src/main/resources/settings.xml
+.github/
+icon-design.html
+
+# Unused Next.js template assets
+front/public/file.svg
+front/public/globe.svg
+front/public/next.svg
+front/public/vercel.svg
+front/public/window.svg
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

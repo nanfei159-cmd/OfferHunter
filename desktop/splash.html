@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offer猎手 · 猎聘投递助手</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: grid;
+    place-items: center;
+    background:
+      radial-gradient(90% 90% at 12% 8%, #e2f6ff 0%, transparent 55%),
+      radial-gradient(90% 90% at 90% 100%, #ffe0c6 0%, transparent 55%),
+      linear-gradient(180deg, #f8fcff 0%, #fff8ec 55%, #ffe9d6 100%);
+    color: #102033;
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    -webkit-app-region: drag;
+    user-select: none;
+    overflow: hidden;
+  }
+  .box { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .logo {
+    position: relative;
+    width: 200px;
+    height: 200px;
+    display: grid;
+    place-items: center;
+  }
+  .halo {
+    position: absolute;
+    width: 176px;
+    height: 176px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255, 196, 120, .38), rgba(255, 196, 120, 0) 70%);
+    filter: blur(2px);
+  }
+  .sun {
+    position: absolute;
+    width: 59px;
+    height: 59px;
+    border-radius: 50%;
+    z-index: 2;
+    filter: drop-shadow(0 0 18px rgba(255, 180, 90, .45));
+  }
+  .lines {
+    position: absolute;
+    width: 200px;
+    height: 200px;
+    z-index: 1;
+    animation: spin 9s linear infinite;
+    will-change: transform;
+    filter: drop-shadow(0 8px 16px rgba(13, 148, 136, .14));
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: .01em;
+    margin: 4px 0 0;
+  }
+  p {
+    margin: 0;
+    font-size: 13px;
+    color: #5b6b7e;
+    letter-spacing: .02em;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .lines { animation: none; }
+  }
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="logo">
+      <div class="halo"></div>
+      <img class="sun" src="splash-sun.png" alt="">
+      <img class="lines" src="splash-lines.png" alt="">
+    </div>
+    <h1>Offer猎手</h1>
+    <p>猎聘投递助手 · 正在启动本地服务…</p>
+  </div>
+</body>
+</html>

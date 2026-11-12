@@ -1,0 +1,202 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Offer猎手：奶油晨光 + 深青轨道 */
+    --background: 38 100% 97%;
+    --foreground: 210 52% 13%;
+    --card: 40 100% 99%;
+    --card-foreground: 210 52% 13%;
+    --popover: 40 100% 99%;
+    --popover-foreground: 210 52% 13%;
+    --primary: 175 77% 26%;
+    --primary-foreground: 40 100% 98%;
+    --secondary: 40 55% 92%;
+    --secondary-foreground: 210 52% 13%;
+    --muted: 40 40% 94%;
+    --muted-foreground: 210 14% 43%;
+    --accent: 174 60% 92%;
+    --accent-foreground: 175 77% 20%;
+    --destructive: 347 77% 50%;
+    --destructive-foreground: 40 100% 98%;
+    --border: 36 32% 86%;
+    --input: 36 32% 86%;
+    --ring: 175 77% 26%;
+    --radius: 0.5rem;
+    --color-titlebg: #ccfbf1;
+    --color-titlebg2: #fef3c7;
+
+    /* Solid Next.js 模板颜色系统（同步到品牌色） */
+    --color-stroke: #eadfcf;
+    --color-strokedark: #23403d;
+    --color-hoverdark: #163330;
+    --color-titlebgdark: #134e4a;
+    --color-btndark: #0b3b3a;
+    --color-white: #ffffff;
+    --color-black: #102033;
+    --color-blackho: #142b29;
+    --color-blacksection: #0e2422;
+    --color-primary: #0f766e;
+    --color-primaryho: #115e59;
+    --color-meta: #14b8a6;
+    --color-waterloo: #6b7a88;
+    --color-manatee: #9fb5b0;
+    --color-alabaster: #fffdf8;
+    --color-zumthor: #f0fdfa;
+    --color-socialicon: #cbd5d1;
+  }
+
+  .dark {
+    --background: 178 40% 7%;
+    --foreground: 40 60% 94%;
+    --card: 178 34% 10%;
+    --card-foreground: 40 60% 94%;
+    --popover: 178 34% 10%;
+    --popover-foreground: 40 60% 94%;
+    --primary: 172 66% 50%;
+    --primary-foreground: 178 50% 8%;
+    --secondary: 178 24% 16%;
+    --secondary-foreground: 40 60% 94%;
+    --muted: 178 24% 16%;
+    --muted-foreground: 172 16% 65%;
+    --accent: 178 24% 18%;
+    --accent-foreground: 172 60% 80%;
+    --destructive: 347 65% 45%;
+    --destructive-foreground: 40 100% 98%;
+    --border: 178 24% 20%;
+    --input: 178 24% 20%;
+    --ring: 172 66% 50%;
+    --color-titlebg: #134e4a;
+    --color-titlebg2: #78350f;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* Offer猎手主画布：左上晨空、右下日出暖光，底色奶油白 */
+.app-canvas {
+  background:
+    radial-gradient(1100px 640px at 4% -12%, rgba(186, 230, 253, 0.62), transparent 62%),
+    radial-gradient(1000px 700px at 104% 108%, rgba(255, 203, 153, 0.55), transparent 64%),
+    #fff9ef;
+}
+
+.dark .app-canvas {
+  background:
+    radial-gradient(1000px 600px at 4% -12%, rgba(13, 148, 136, 0.16), transparent 62%),
+    radial-gradient(900px 640px at 104% 108%, rgba(249, 115, 22, 0.12), transparent 64%),
+    #0a1f1e;
+}
+
+/* Solid Next.js 模板工具类 */
+@layer utilities {
+  .dropdown-panel {
+    @apply fixed z-[99999] max-h-56 overflow-y-auto rounded-xl;
+    border: 1px solid #eadfcf;
+    background-color: #fffdf8;
+    color: #102033;
+    box-shadow: 0 18px 44px -20px rgba(15, 76, 74, 0.35);
+  }
+
+  .dark .dropdown-panel {
+    border-color: #23403d;
+    background-color: #0e2422;
+    color: #f0f7f5;
+  }
+
+  /* 深青日志终端滚动条 */
+  .log-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+  .log-scroll::-webkit-scrollbar-thumb {
+    background: rgba(15, 118, 110, 0.22);
+    border-radius: 999px;
+  }
+  .dark .log-scroll::-webkit-scrollbar-thumb {
+    background: rgba(204, 251, 241, 0.24);
+  }
+  .log-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* 强制覆盖 input 自动填充样式 */
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus,
+  input:-webkit-autofill:active {
+    -webkit-box-shadow: 0 0 0 1000px #fffdf8 inset !important;
+    -webkit-text-fill-color: #102033 !important;
+    transition: background-color 5000s ease-in-out 0s;
+  }
+  .dark input:-webkit-autofill,
+  .dark input:-webkit-autofill:hover,
+  .dark input:-webkit-autofill:focus,
+  .dark input:-webkit-autofill:active {
+    -webkit-box-shadow: 0 0 0 1000px #0e2422 inset !important;
+    -webkit-text-fill-color: #f0f7f5 !important;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  /* Framer Motion 动画辅助类 */
+  .animate_top {
+    animation: animateTop 0.6s ease-out;
+  }
+
+  .animate_left {
+    animation: animateLeft 0.6s ease-out;
+  }
+
+  .animate_right {
+    animation: animateRight 0.6s ease-out;
+  }
+
+  @keyframes animateTop {
+    0% {
+      opacity: 0;
+      transform: translateY(-20px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes animateLeft {
+    0% {
+      opacity: 0;
+      transform: translateX(-20px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes animateRight {
+    0% {
+      opacity: 0;
+      transform: translateX(20px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+}

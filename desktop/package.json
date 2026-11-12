@@ -1,0 +1,58 @@
+{
+  "name": "offer-hunter-liepin-desktop",
+  "version": "2.0.1",
+  "private": true,
+  "description": "Offer猎手 · 猎聘投递助手桌面版",
+  "author": "Offer猎手 contributors",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "45.3.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.offerhunter.liepin",
+    "productName": "Offer猎手",
+    "icon": "icon.ico",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "splash.html",
+      "splash-lines.png",
+      "splash-sun.png"
+    ],
+    "extraResources": [
+      {
+        "from": "../build/libs/get_jobs-2.0.1.jar",
+        "to": "getjobs.jar"
+      },
+      {
+        "from": "../build/patchright-driver",
+        "to": "patchright-driver"
+      },
+      {
+        "from": "../db-template/getjobs.db",
+        "to": "db/getjobs.db"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "OfferHunter-${version}-win-x64.${ext}"
+    },
+    "portable": {
+      "artifactName": "OfferHunter-${version}-portable.exe"
+    }
+  }
+}

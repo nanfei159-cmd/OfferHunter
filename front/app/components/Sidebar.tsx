@@ -207,7 +207,7 @@ export default function Sidebar() {
         className="absolute bottom-0 left-0 right-0 border-t border-[#E7DCCB] p-4 dark:border-[#23403D]"
       >
         <div className="text-center">
-          <p className="text-xs text-[#5F7C79]/90 dark:text-[#8FC9C1]/80">v2.0.1 · Offer猎手</p>
+          <p className="text-xs text-[#5F7C79]/90 dark:text-[#8FC9C1]/80">v2.0.2 · Offer猎手</p>
         </div>
       </motion.div>
     </motion.div>

@@ -1,13 +1,13 @@
 {
   "name": "offer-hunter-liepin-desktop",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "private": true,
   "description": "Offer猎手 · 猎聘投递助手桌面版",
   "author": "Offer猎手 contributors",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist": "electron-builder --win portable"
+    "dist": "electron-builder --win"
   },
   "devDependencies": {
     "electron": "45.3.1",
@@ -28,7 +28,7 @@
     ],
     "extraResources": [
       {
-        "from": "../build/libs/get_jobs-2.0.1.jar",
+        "from": "../build/libs/get_jobs-2.0.2.jar",
         "to": "getjobs.jar"
       },
       {
@@ -44,6 +44,12 @@
       "target": [
         {
           "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
           "arch": [
             "x64"
           ]

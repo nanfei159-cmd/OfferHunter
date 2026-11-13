@@ -6,7 +6,7 @@ spring:
   info:
     app:
       name: Get Jobs
-      version: 2.0.1
+      version: 2.0.2
       description: https://github.com/loks666/get_jobs
   banner:
     charset: UTF-8

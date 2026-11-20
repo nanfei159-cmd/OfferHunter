@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "com.getjobs"
-version = "2.0.2"
+version = "2.0.3"
 
 java {
     toolchain { languageVersion.set(JavaLanguageVersion.of(21)) }

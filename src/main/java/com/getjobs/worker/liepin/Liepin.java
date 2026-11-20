@@ -288,6 +288,59 @@ public class Liepin {
     }
 
     /**
+     * 关闭「我的沟通」右侧栏（如果出现）。它常驻在卡片右侧，会拦截悬停和点击，
+     * 聊天结束后不关会让下一张卡片的按钮点不到。
+     */
+    private void closeImSidebarIfPresent() {
+        try {
+            Locator sidebar = page.locator("#lp-sider-bar-container");
+            if (sidebar.count() == 0 || !sidebar.first().isVisible()) return;
+            Locator close = sidebar.locator("span[aria-label='close'], button[aria-label='close'], .ant-drawer-close");
+            if (close.count() > 0 && close.first().isVisible()) {
+                close.first().click(new Locator.ClickOptions().setForce(true).setTimeout(3000));
+                PlaywrightUtil.sleep(1);
+            }
+        } catch (Exception e) {
+            log.debug("关闭沟通侧栏失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 在当前卡片里重新找一个可点击的动作按钮。
+     * 猎聘的按钮悬停后才显示；抓完详情页回来悬停态会丢，按钮被收起，
+     * 旧的 locator 再点就是 30 秒超时。点击前用这个方法重新定位。
+     */
+    private Locator findActionButton(Locator card) {
+        String[] selectors = {
+            "button.ant-btn.ant-btn-primary.ant-btn-round",
+            "button.ant-btn.ant-btn-round.ant-btn-primary",
+            "button[class*='ant-btn'][class*='primary']",
+            "button[class*='ant-btn'][class*='round']",
+            "button:has-text('聊一聊')",
+            "button:has-text('投简历')",
+            "button:has-text('继续聊')"
+        };
+        for (String selector : selectors) {
+            Locator buttons = card.locator(selector);
+            int buttonCount = buttons.count();
+            for (int j = 0; j < buttonCount; j++) {
+                Locator b = buttons.nth(j);
+                try {
+                    if (!b.isVisible()) continue;
+                    String text = b.textContent();
+                    if (text == null) continue;
+                    String t = text.trim();
+                    if (t.contains("聊一聊") || t.contains("投简历") || t.contains("投递简历") || t.contains("继续聊")) {
+                        return b;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * 解析配置的目标城市列表；空列表或“全国”视为不限，返回一个 code 为空的全国任务。
      */
     private List<CityTarget> resolveCityTargets() {
@@ -594,8 +647,10 @@ public class Liepin {
             // 订阅弹窗可能在处理某张卡片时才弹出（不止在翻页时），换页才检查一次不够——
             // 弹窗一旦残留会挡住后面所有卡片的点击，表现为"只投了第一个就没反应了"，故每张卡片处理前都查一次
             closeSubscribePopupIfPresent();
+            closeImSidebarIfPresent();
             // 获取当前岗位卡片（用于后续操作与缺省展示）
             Locator currentJobCard = page.locator(JOB_CARDS).nth(i);
+            Locator hrArea = null;
             // 页面下发两次搜索接口响应时，先到后到顺序不定，lastApiEntities的顺序可能和DOM卡片顺序对不上，
             // 所以不能按下标i直接取，改成用卡片自身DOM属性里的jobId去匹配，取不到再退化到按下标取
             Long cardJobId = extractJobIdFromCard(currentJobCard);
@@ -685,7 +740,7 @@ public class Liepin {
                 }
                 
                 // 查找HR区域 - 尝试多种可能的HR标签选择器
-                Locator hrArea = null;
+                hrArea = null;
                 String[] hrSelectors = {
                     ".recruiter-info-box",  // 根据页面源码，这是主要的HR区域类名
                     ".recruiter-info, .hr-info, .contact-info",
@@ -722,7 +777,7 @@ public class Liepin {
                         }
                         
                         // 直接悬停，不再进行复杂的微调
-                        hrArea.hover(new Locator.HoverOptions().setTimeout(5000));
+                        hrArea.hover(new Locator.HoverOptions().setTimeout(3000).setForce(true));
                         hoverSuccess = true;
                         break;
                     } catch (Exception hoverError) {
@@ -853,6 +908,30 @@ public class Liepin {
                 continue;
             }
 
+            // 抓取详情页会新开标签页，回来后列表可能重渲染、悬停态丢失，按钮被收起。
+            // 点击前重新悬停并重新定位按钮，否则会等 30 秒超时后漏投。
+            if (button != null) {
+                try {
+                    if (hrArea != null && hrArea.count() > 0 && hrArea.first().isVisible()) {
+                        hrArea.first().hover(new Locator.HoverOptions().setTimeout(3000).setForce(true));
+                    }
+                } catch (Exception e) {
+                    log.warn("点击前重新悬停失败: {}", e.getMessage());
+                }
+                Locator refreshed = findActionButton(currentJobCard);
+                if (refreshed != null) {
+                    button = refreshed;
+                    try {
+                        String t = button.textContent();
+                        if (t != null && !t.trim().isEmpty()) buttonText = t.trim();
+                    } catch (Exception ignored) {
+                    }
+                } else {
+                    button = null;
+                    buttonText = "";
+                }
+            }
+
             // 检查按钮文本并点击
             if (button != null && buttonText.contains("聊一聊")) {
                 try {
@@ -885,7 +964,7 @@ public class Liepin {
                         log.warn("鼠标微调失败，直接点击按钮: {}", moveError.getMessage());
                     }
                     
-                    button.click();
+                    button.click(new Locator.ClickOptions().setTimeout(10000).setForce(true));
                     PlaywrightUtil.sleep(2); // 等待聊天面板加载
 
                     // 猎聘点击"聊一聊"会自动发送一句系统默认招呼语，这里补发自定义打招呼语，
@@ -987,7 +1066,7 @@ public class Liepin {
             } else if (button != null && (buttonText.contains("投简历") || buttonText.contains("投递简历"))) {
                 // 直接投递类岗位：点击即完成投递，无聊天窗口需要关闭
                 try {
-                    button.click();
+                    button.click(new Locator.ClickOptions().setTimeout(10000).setForce(true));
                     PlaywrightUtil.sleep(1);
                     resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
                     sb.setLength(0);

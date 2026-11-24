@@ -33,6 +33,15 @@ public class ConfigService {
         // 公司规模筛选：同样支持 [a,b] 格式，为空表示不限
         config.setCompanyScale(parseBracketList(entity != null ? entity.getCompanyScale() : null));
 
+        // 招聘方类型：all/enterprise/headhunter，空按全部处理
+        config.setRecruiterType(entity != null ? entity.getRecruiterType() : null);
+
+        // 重复投递冷却：默认 1 天，0 表示不限制
+        config.setReapplyAfterDays(entity == null || entity.getReapplyAfterDays() == null ? 1 : entity.getReapplyAfterDays());
+
+        // 岗位名称排除词：逗号分隔，空表示不排除
+        config.setTitleExcludeKeywords(parseBracketList(entity != null ? entity.getTitleExclude() : null));
+
         // 城市：支持 [深圳,广州] 多选；允许名称或代码；全国/空表示不限
         java.util.List<String> cityCodes = new java.util.ArrayList<>();
         java.util.List<String> cityNames = new java.util.ArrayList<>();

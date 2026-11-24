@@ -3,7 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useState } from 'react'
-import { BiSearch, BiMoon, BiSun } from 'react-icons/bi'
+import { BiSearch, BiMoon, BiSun, BiBarChartAlt2 } from 'react-icons/bi'
 import { motion } from 'framer-motion'
 import { useTheme } from 'next-themes'
 import { API_BASE } from '@/lib/api'
@@ -65,7 +65,8 @@ export default function Sidebar() {
   }, [])
 
   const platformGroup = [
-    { href: '/liepin', icon: BiSearch, label: '猎聘' },
+    { href: '/liepin', icon: BiSearch, label: '猎聘平台配置' },
+    { href: '/liepin/analysis', icon: BiBarChartAlt2, label: '猎聘投递分析' },
   ]
 
   return (
@@ -207,7 +208,7 @@ export default function Sidebar() {
         className="absolute bottom-0 left-0 right-0 border-t border-[#E7DCCB] p-4 dark:border-[#23403D]"
       >
         <div className="text-center">
-          <p className="text-xs text-[#5F7C79]/90 dark:text-[#8FC9C1]/80">v2.0.3 · Offer猎手</p>
+          <p className="text-xs text-[#5F7C79]/90 dark:text-[#8FC9C1]/80">v2.1.0 · Offer猎手</p>
         </div>
       </motion.div>
     </motion.div>

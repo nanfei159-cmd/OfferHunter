@@ -51,7 +51,7 @@
 
 使用步骤：
 
-1. 从 [Releases](../../releases/latest) 下载 `OfferHunter-2.0.3-portable.exe`（单文件便携版），或下载 `OfferHunter-2.0.3-win-x64.zip`（解压后运行 `Offer猎手.exe`）。
+1. 从 [Releases](../../releases/latest) 下载 `OfferHunter-2.1.0-portable.exe`（单文件便携版），或下载 `OfferHunter-2.1.0-win-x64.zip`（解压后运行 `Offer猎手.exe`）。
 2. 双击运行。首次启动会打开猎聘登录页，在浏览器窗口里完成登录。
 3. 填写搜索关键词、选择城市和筛选条件，点击「保存配置」。
 4. 点击「开始投递」，建议先用小批量关键词试跑；随时可以点「停止投递」。

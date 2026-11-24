@@ -59,6 +59,9 @@ public class LiepinService {
                 " hr_title          VARCHAR(100)," +
                 " hr_im_id          VARCHAR(64)," +
                 " delivered         INTEGER DEFAULT 0," +
+                " delivered_at      DATETIME," +
+                " stage             VARCHAR(20) DEFAULT 'discovered'," +
+                " stage_reason      VARCHAR(500)," +
                 " create_time       DATETIME," +
                 " update_time       DATETIME" +
                 ")";
@@ -67,6 +70,9 @@ public class LiepinService {
             // 兼容旧库：尝试添加 delivered 列（如已存在则忽略错误）
             try {
                 stmt.execute("ALTER TABLE liepin_data ADD COLUMN delivered INTEGER DEFAULT 0");
+            } catch (Exception ignored) {}
+            try {
+                stmt.execute("ALTER TABLE liepin_data ADD COLUMN delivered_at DATETIME");
             } catch (Exception ignored) {}
             // 兼容旧库：尝试移除无数据列（SQLite 3.35+ 支持；不支持则忽略错误）
             try { stmt.execute("ALTER TABLE liepin_data DROP COLUMN job_function"); } catch (Exception ignored) {}
@@ -81,6 +87,8 @@ public class LiepinService {
             try { stmt.execute("ALTER TABLE liepin_data ADD COLUMN hr_active_status VARCHAR(100)"); } catch (Exception ignored) {}
             try { stmt.execute("ALTER TABLE liepin_data ADD COLUMN job_description TEXT"); } catch (Exception ignored) {}
             try { stmt.execute("ALTER TABLE liepin_data ADD COLUMN recruitment_status VARCHAR(100)"); } catch (Exception ignored) {}
+            try { stmt.execute("ALTER TABLE liepin_data ADD COLUMN stage VARCHAR(20) DEFAULT 'discovered'"); } catch (Exception ignored) {}
+            try { stmt.execute("ALTER TABLE liepin_data ADD COLUMN stage_reason VARCHAR(500)"); } catch (Exception ignored) {}
             log.info("确保 liepin_data 表已存在");
         } catch (Exception e) {
             log.warn("创建 liepin_data 表失败: {}", e.getMessage());
@@ -137,6 +145,17 @@ public class LiepinService {
         }
     }
 
+    /** 按 job_id 取岗位快照；直投模式用 */
+    public LiepinEntity getById(Long jobId) {
+        if (jobId == null) return null;
+        try {
+            return liepinMapper.selectById(jobId);
+        } catch (Exception e) {
+            log.warn("查询岗位失败 job_id={}: {}", jobId, e.getMessage());
+            return null;
+        }
+    }
+
     /**
      * 岗位是否已经投递过（用于重跑时跳过，避免重复发招呼语）
      */
@@ -152,6 +171,75 @@ public class LiepinService {
     }
 
     /**
+     * 岗位是否在冷却期内投递过；超过 N 天允许再次投递。
+     * 旧数据没有 delivered_at 时按可再次投递处理。
+     */
+    public boolean isRecentlyDelivered(Long jobId, int days) {
+        if (jobId == null) return false;
+        try {
+            LiepinEntity existing = liepinMapper.selectById(jobId);
+            if (existing == null || existing.getDelivered() == null || existing.getDelivered() != 1) return false;
+            LocalDateTime at = existing.getDeliveredAt();
+            if (at == null) return false;
+            return at.isAfter(LocalDateTime.now().minusDays(Math.max(0, days)));
+        } catch (Exception e) {
+            log.warn("查询投递冷却失败 job_id={}: {}", jobId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 同公司同岗位最近一次投递是否还在冷却期内。
+     * 用于直投清单去重：同一家公司同一个岗位可能有多个 HR、多个 job_id，只发一次。
+     */
+    public boolean isGroupRecentlyDelivered(String compName, String jobTitle, int days) {
+        if (compName == null || compName.isBlank() || jobTitle == null || jobTitle.isBlank()) return false;
+        try {
+            QueryWrapper<LiepinEntity> wrapper = new QueryWrapper<>();
+            wrapper.eq("delivered", 1);
+            wrapper.eq("comp_name", compName.trim());
+            wrapper.eq("job_title", jobTitle.trim());
+            wrapper.isNotNull("delivered_at");
+            wrapper.orderByDesc("delivered_at");
+            wrapper.last("LIMIT 1");
+            LiepinEntity latest = liepinMapper.selectOne(wrapper);
+            if (latest == null || latest.getDeliveredAt() == null) return false;
+            return latest.getDeliveredAt().isAfter(LocalDateTime.now().minusDays(Math.max(0, days)));
+        } catch (Exception e) {
+            log.warn("查询同公司同岗位投递冷却失败 comp={}, title={}: {}", compName, jobTitle, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 同一 HR 最近一次投递是否还在冷却期内。
+     * 优先按 hr_im_id；没有 IM ID 时退回 hr_name + comp_name。
+     */
+    public boolean isHrRecentlyDelivered(String hrImId, String hrName, String compName, int days) {
+        try {
+            QueryWrapper<LiepinEntity> wrapper = new QueryWrapper<>();
+            wrapper.eq("delivered", 1);
+            if (hrImId != null && !hrImId.isBlank()) {
+                wrapper.eq("hr_im_id", hrImId.trim());
+            } else if (hrName != null && !hrName.isBlank() && compName != null && !compName.isBlank()) {
+                wrapper.eq("hr_name", hrName.trim());
+                wrapper.eq("comp_name", compName.trim());
+            } else {
+                return false;
+            }
+            wrapper.isNotNull("delivered_at");
+            wrapper.orderByDesc("delivered_at");
+            wrapper.last("LIMIT 1");
+            LiepinEntity latest = liepinMapper.selectOne(wrapper);
+            if (latest == null || latest.getDeliveredAt() == null) return false;
+            return latest.getDeliveredAt().isAfter(LocalDateTime.now().minusDays(Math.max(0, days)));
+        } catch (Exception e) {
+            log.warn("查询 HR 投递冷却失败 hrImId={}, hrName={}: {}", hrImId, hrName, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * 标记岗位为已投递（delivered=1），如存在该记录
      */
     public void markDelivered(Long jobId) {
@@ -162,6 +250,7 @@ public class LiepinService {
                 LiepinEntity update = new LiepinEntity();
                 update.setJobId(jobId);
                 update.setDelivered(1);
+                update.setDeliveredAt(LocalDateTime.now());
                 update.setCreateTime(existing.getCreateTime());
                 update.setUpdateTime(LocalDateTime.now());
                 liepinMapper.updateById(update);
@@ -236,8 +325,8 @@ public class LiepinService {
         String sql = "INSERT INTO liepin_data (" +
                 "job_id, job_title, job_link, job_salary_text, job_area, job_edu_req, job_exp_req, job_publish_time, " +
                 "comp_id, comp_name, comp_industry, comp_scale, " +
-                "hr_id, hr_name, hr_title, hr_im_id, delivered, create_time, update_time) " +
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+                "hr_id, hr_name, hr_title, hr_im_id, delivered, stage, stage_reason, create_time, update_time) " +
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
         try (Connection conn = dataSource.getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
             conn.setAutoCommit(false);
             for (LiepinEntity e : toInsert) {
@@ -275,10 +364,14 @@ public class LiepinService {
                 if (e.getHrImId() == null) ps.setNull(16, Types.VARCHAR); else ps.setString(16, e.getHrImId());
                 // 17 delivered
                 if (e.getDelivered() == null) ps.setNull(17, Types.INTEGER); else ps.setInt(17, e.getDelivered());
-                // 18 create_time
-                if (e.getCreateTime() == null) ps.setNull(18, Types.TIMESTAMP); else ps.setTimestamp(18, Timestamp.valueOf(e.getCreateTime()));
-                // 19 update_time
-                if (e.getUpdateTime() == null) ps.setNull(19, Types.TIMESTAMP); else ps.setTimestamp(19, Timestamp.valueOf(e.getUpdateTime()));
+                // 18 stage
+                if (e.getStage() == null) ps.setString(18, "discovered"); else ps.setString(18, e.getStage());
+                // 19 stage_reason
+                if (e.getStageReason() == null) ps.setNull(19, Types.VARCHAR); else ps.setString(19, e.getStageReason());
+                // 20 create_time
+                if (e.getCreateTime() == null) ps.setNull(20, Types.TIMESTAMP); else ps.setTimestamp(20, Timestamp.valueOf(e.getCreateTime()));
+                // 21 update_time
+                if (e.getUpdateTime() == null) ps.setNull(21, Types.TIMESTAMP); else ps.setTimestamp(21, Timestamp.valueOf(e.getUpdateTime()));
 
                 ps.addBatch();
             }
@@ -339,6 +432,15 @@ public class LiepinService {
         }
         if (config.getCompanyScale() != null) {
             existing.setCompanyScale(config.getCompanyScale());
+        }
+        if (config.getRecruiterType() != null) {
+            existing.setRecruiterType(config.getRecruiterType());
+        }
+        if (config.getReapplyAfterDays() != null) {
+            existing.setReapplyAfterDays(config.getReapplyAfterDays());
+        }
+        if (config.getTitleExclude() != null) {
+            existing.setTitleExclude(config.getTitleExclude());
         }
         if (config.getSayHi() != null) {
             existing.setSayHi(config.getSayHi());

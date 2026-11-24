@@ -44,6 +44,13 @@ public class LiepinEntity {
     // ========== 投递状态 ==========
     // 是否已投递：0 未投递（默认），1 已投递
     private Integer delivered;
+    // 最近一次投递时间，用于重复投递冷却（不是岗位详情更新时间）
+    private LocalDateTime deliveredAt;
+
+    // ========== 投递状态 ==========
+    // discovered / applied / failed / skipped
+    private String stage;
+    private String stageReason;
 
     // ========== 系统字段 ==========
     private LocalDateTime createTime;

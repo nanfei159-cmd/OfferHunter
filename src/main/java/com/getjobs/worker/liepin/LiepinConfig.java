@@ -69,4 +69,20 @@ public class LiepinConfig {
      */
     private List<String> companyScale;
 
+    /**
+     * 招聘方类型：all=全部（默认），enterprise=企业，headhunter=猎头。
+     * 按 recruiter.recruiterTitle 识别，猎头顾问/猎头/顾问(SC/AC) 视为猎头，其余（含未知）视为企业。
+     */
+    private String recruiterType;
+
+    /**
+     * 重复投递冷却天数：上次投递后隔多少天允许再次投递；默认 1，0 表示不限制。
+     */
+    private Integer reapplyAfterDays;
+
+    /**
+     * 岗位名称排除词：标题命中任一关键词就跳过，例如 销售/业务/BD。
+     */
+    private List<String> titleExcludeKeywords;
+
 }

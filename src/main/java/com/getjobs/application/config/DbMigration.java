@@ -43,6 +43,9 @@ public class DbMigration implements ApplicationRunner {
                     city VARCHAR(200),
                     salary_code VARCHAR(200),
                     company_scale VARCHAR(200),
+                    recruiter_type VARCHAR(20) DEFAULT 'all',
+                    reapply_after_days INTEGER DEFAULT 1,
+                    title_exclude VARCHAR(500) DEFAULT '销售,客户经理,大客户,BD,业务员,招商,电销,营销',
                     say_hi TEXT,
                     send_say_hi INTEGER DEFAULT 1,
                     same_hr_filter INTEGER DEFAULT 1,
@@ -55,6 +58,14 @@ public class DbMigration implements ApplicationRunner {
                 )""");
         addColumnIfMissing("liepin_config", "debugger", "INTEGER DEFAULT 0");
         addColumnIfMissing("liepin_config", "company_scale", "VARCHAR(200)");
+        addColumnIfMissing("liepin_config", "recruiter_type", "VARCHAR(20) DEFAULT 'all'");
+        addColumnIfMissing("liepin_config", "reapply_after_days", "INTEGER DEFAULT 1");
+        addColumnIfMissing("liepin_config", "title_exclude", "VARCHAR(500) DEFAULT '销售,客户经理,大客户,BD,业务员,招商,电销,营销'");
+        // 旧版默认排除词把“业务/商务”当排除词，误伤仓储业务经理、配送业务负责人等
+        // 运营管理岗。只迁移仍是旧默认值的配置，用户自己改过的不动。
+        jdbcTemplate.update("UPDATE liepin_config SET title_exclude = ? WHERE title_exclude = ?",
+                "销售,客户经理,大客户,BD,业务员,招商,电销,营销",
+                "销售,业务,BD,客户经理,商务");
         addColumnIfMissing("liepin_config", "say_hi", "TEXT");
         addColumnIfMissing("liepin_config", "send_say_hi", "INTEGER DEFAULT 1");
         addColumnIfMissing("liepin_config", "same_hr_filter", "INTEGER DEFAULT 1");
@@ -87,12 +98,20 @@ public class DbMigration implements ApplicationRunner {
                     job_description TEXT,
                     recruitment_status TEXT,
                     delivered INTEGER DEFAULT 0,
+                    delivered_at DATETIME,
+                    stage VARCHAR(20) DEFAULT 'discovered',
+                    stage_reason VARCHAR(500),
                     create_time DATETIME,
                     update_time DATETIME
                 )""");
         addColumnIfMissing("liepin_data", "hr_active_status", "TEXT");
         addColumnIfMissing("liepin_data", "job_description", "TEXT");
         addColumnIfMissing("liepin_data", "recruitment_status", "TEXT");
+        addColumnIfMissing("liepin_data", "delivered_at", "DATETIME");
+        addColumnIfMissing("liepin_data", "stage", "VARCHAR(20) DEFAULT 'discovered'");
+        addColumnIfMissing("liepin_data", "stage_reason", "VARCHAR(500)");
+        // 老库里已投递的岗位归到 applied，避免分析页把它们显示成未处理
+        jdbcTemplate.update("UPDATE liepin_data SET stage='applied' WHERE delivered=1 AND (stage IS NULL OR stage='discovered')");
     }
 
     private void ensureLiepinOption() {

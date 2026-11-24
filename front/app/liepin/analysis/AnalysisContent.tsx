@@ -370,7 +370,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
         currentPage += 1
       }
 
-      // 导出列与表格完全一致（19列；公司地址/融资阶段/公司介绍猎聘平台没有，固定留空）
+      // 导出列与表格一致（19列；公司地址/融资阶段/公司介绍猎聘平台没有，固定留空）
       const header = [
         "公司名称",
         "岗位名称",

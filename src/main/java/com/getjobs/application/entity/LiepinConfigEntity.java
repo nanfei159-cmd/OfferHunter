@@ -29,6 +29,15 @@ public class LiepinConfigEntity {
     /** 公司规模筛选，括号列表（如 [100-499人,500-999人]），空表示不限 */
     private String companyScale;
 
+    /** 招聘方类型：all=全部，enterprise=企业，headhunter=猎头 */
+    private String recruiterType;
+
+    /** 重复投递冷却天数：上次投递后隔多少天允许再次投递（默认 1） */
+    private Integer reapplyAfterDays;
+
+    /** 岗位名称排除词，逗号分隔；命中任一即跳过 */
+    private String titleExclude;
+
     /** 打招呼语（聊一聊后续发送的自定义文案） */
     private String sayHi;
 

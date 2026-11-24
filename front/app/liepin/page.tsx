@@ -8,9 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import CityMultiSelect from '@/app/components/CityMultiSelect'
-import AnalysisContent from '@/app/liepin/analysis/AnalysisContent'
 import PageHeader from '@/app/components/PageHeader'
 import { API_BASE } from '@/lib/api'
 
@@ -21,6 +19,9 @@ interface LiepinConfig {
   city?: string
   salaryCode?: string
   companyScale?: string
+  recruiterType?: string
+  reapplyAfterDays?: number
+  titleExclude?: string
   sayHi?: string
   sendSayHi?: number
   sameHrFilter?: number
@@ -80,6 +81,9 @@ export default function LiepinPage() {
     keywords: '',
     city: '',
     salaryCode: '',
+    recruiterType: 'all',
+    reapplyAfterDays: 1,
+    titleExclude: '销售,客户经理,大客户,BD,业务员,招商,电销,营销',
     sayHi: '',
     sendSayHi: 1,
     sameHrFilter: 1,
@@ -185,6 +189,29 @@ export default function LiepinPage() {
     }
   }, [])
 
+  // 定时同步后台任务状态：页面刷新/重新打开、任务自然结束、重复点击开始时，按钮以后端状态为准
+  useEffect(() => {
+    let cancelled = false
+    const syncStatus = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/liepin/status`)
+        const data = await res.json()
+        if (!cancelled && data.success) {
+          setIsDelivering(Boolean(data.isRunning))
+          if (typeof data.isLoggedIn === 'boolean') setIsLoggedIn(data.isLoggedIn)
+        }
+      } catch {
+        // 网络抖动忽略，下一轮再同步
+      }
+    }
+    syncStatus()
+    const timer = setInterval(syncStatus, 5000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [])
+
   // 将数据库中的 JSON 数组字符串转换为逗号分隔的可读字符串
   const parseKeywordsFromDb = (raw?: string): string => {
     if (!raw) return ''
@@ -257,6 +284,9 @@ export default function LiepinPage() {
         if (normalized.sameHrFilter == null) normalized.sameHrFilter = 1
         if (normalized.publishWithinDays == null) normalized.publishWithinDays = 90
         if (normalized.hrActiveWithinDays == null) normalized.hrActiveWithinDays = 30
+        if (normalized.recruiterType == null) normalized.recruiterType = 'all'
+        if (normalized.reapplyAfterDays == null) normalized.reapplyAfterDays = 1
+        if (normalized.titleExclude == null) normalized.titleExclude = '销售,客户经理,大客户,BD,业务员,招商,电销,营销'
         setConfig(normalized)
         setSelectedCompanyScale(parseBracketList(data.config.companyScale))
         const cityOptions = data.options?.city || []
@@ -337,10 +367,12 @@ export default function LiepinPage() {
 
       if (data.success) {
         // 启动成功：不弹框
+        setIsDelivering(true)
       } else {
         // 启动失败：不弹框
         console.warn('启动失败：', data.message)
-        setIsDelivering(false)
+        // 后端已经在运行不算失败，按钮应显示为「停止投递」
+        setIsDelivering(data.status === 'running')
       }
     } catch (error) {
       console.error('Failed to start delivery:', error)
@@ -362,6 +394,8 @@ export default function LiepinPage() {
       } else {
         // 停止失败：不弹框
         console.warn('停止失败：', data.message)
+        // 后端已经没任务时，按钮回到「开始投递」
+        if (data.message?.includes('没有正在运行')) setIsDelivering(false)
       }
     } catch (error) {
       console.error('Failed to stop delivery:', error)
@@ -399,7 +433,7 @@ export default function LiepinPage() {
     <div className="space-y-6">
       <PageHeader
         icon={<BiSearch className="text-2xl" />}
-        title="猎聘配置"
+        title="猎聘平台配置"
         subtitle="配置猎聘平台的求职参数"
         iconClass="text-brand-teal dark:text-[#5EEAD4]"
         accentBgClass="bg-gradient-to-br from-brand-tealsoft to-[#FEF3C7] dark:from-brand-teal/20 dark:to-amber-500/10"
@@ -432,14 +466,7 @@ export default function LiepinPage() {
         }
       />
 
-      <Tabs defaultValue="config" className="w-full">
-        <TabsList className="grid w-full grid-cols-2">
-          <TabsTrigger value="config">平台配置</TabsTrigger>
-          <TabsTrigger value="analytics">投递分析</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="config" className="mt-6">
-        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
+      <div className="mt-6 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_380px] gap-6 items-start">
         <div className="space-y-6 min-w-0 order-2 xl:order-1">
         {/* 平台说明 */}
         <Card className="animate-in fade-in slide-in-from-bottom-5 border-brand-teal/20 bg-gradient-to-br from-brand-mint/80 via-brand-paper to-[#FFF7E8] duration-700 dark:border-brand-teal/30 dark:bg-none dark:bg-[#0E2422]">
@@ -605,6 +632,45 @@ export default function LiepinPage() {
               </div>
               <p className="text-xs text-muted-foreground">不勾选表示不限；猎聘搜索接口不支持按规模硬过滤，命中的是投递前用已抓取数据做的二次校验</p>
 
+              <div className="space-y-2 pt-2">
+                <Label htmlFor="titleExclude">岗位名称排除词</Label>
+                <Input
+                  id="titleExclude"
+                  value={config.titleExclude || ''}
+                  onChange={(e) => setConfig({ ...config, titleExclude: e.target.value })}
+                  placeholder="例如：销售,客户经理,大客户,BD"
+                />
+                <p className="text-xs text-muted-foreground">逗号分隔，岗位标题命中任意一个就跳过；只填明确不投的销售类词，别填“业务/商务”这类通用词，会误伤运营管理岗</p>
+              </div>
+
+              <Label className="pt-2">招聘方类型</Label>
+              <div className="flex flex-wrap gap-2">
+                {[
+                  { value: 'all', label: '全部' },
+                  { value: 'enterprise', label: '企业' },
+                  { value: 'headhunter', label: '猎头' },
+                ].map((opt) => {
+                  const active = (config.recruiterType || 'all') === opt.value
+                  return (
+                    <label
+                      key={opt.value}
+                      className={`${CHIP_BASE} ${active ? CHIP_ACTIVE : CHIP_IDLE}`}
+                    >
+                      <input
+                        type="radio"
+                        name="recruiterType"
+                        checked={active}
+                        onChange={() => setConfig({ ...config, recruiterType: opt.value })}
+                        className="sr-only peer"
+                      />
+                      <span className={CHIP_BOX}></span>
+                      {opt.label}
+                    </label>
+                  )
+                })}
+              </div>
+              <p className="text-xs text-muted-foreground">按招聘者职位区分；识别不了的职位按企业处理</p>
+
               <label className="flex items-start gap-2 pt-2 text-sm cursor-pointer">
                 <input
                   type="checkbox"
@@ -613,12 +679,26 @@ export default function LiepinPage() {
                   onChange={(e) => setConfig({ ...config, sameHrFilter: e.target.checked ? 1 : 0 })}
                 />
                 <span>
-                  同一 HR 只打一次招呼
+                  同一 HR 冷却期内只打一次招呼
                   <span className="mt-0.5 block text-xs text-muted-foreground">
-                    同一个 HR 发布多个岗位时，只处理第一个，避免在同一个聊天里重复发招呼语。
+                    同一个 HR 发布多个岗位时，冷却期内只处理第一个；超过间隔天数可以再次投递。
                   </span>
                 </span>
               </label>
+
+              <div className="space-y-2 pt-2">
+                <Label htmlFor="reapplyAfterDays">重复投递间隔（天）</Label>
+                <Input
+                  id="reapplyAfterDays"
+                  type="number"
+                  min={0}
+                  value={config.reapplyAfterDays ?? 1}
+                  onChange={(e) => setConfig({ ...config, reapplyAfterDays: Number(e.target.value) })}
+                />
+                <p className="text-xs text-muted-foreground">
+                  上次投递/打招呼后，隔这么多天没有回复可以再次投递；0 表示不限制。
+                </p>
+              </div>
             </div>
           </CardContent>
         </Card>
@@ -768,12 +848,6 @@ export default function LiepinPage() {
           </Card>
         </aside>
         </div>
-        </TabsContent>
-
-        <TabsContent value="analytics" className="space-y-6 mt-6">
-          <AnalysisContent />
-        </TabsContent>
-      </Tabs>
 
       {/* 退出确认弹框 */}
       {showLogoutDialog && (

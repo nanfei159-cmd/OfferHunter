@@ -11,9 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -40,6 +38,15 @@ public class LiepinJobService implements JobPlatformService {
 
     @Override
     public void executeDelivery(Consumer<JobProgressMessage> progressCallback) {
+        execute(progressCallback, false);
+    }
+
+    /** 按 allowlist 清单直投：不跑关键词/城市，逐个打开 job_link */
+    public void executeAllowlist(Consumer<JobProgressMessage> progressCallback) {
+        execute(progressCallback, true);
+    }
+
+    private void execute(Consumer<JobProgressMessage> progressCallback, boolean direct) {
         if (isRunning) {
             progressCallback.accept(JobProgressMessage.warning(PLATFORM, "任务已在运行中"));
             return;
@@ -67,7 +74,7 @@ public class LiepinJobService implements JobPlatformService {
             LiepinConfig config = configService.getLiepinConfig();
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "配置加载成功"));
 
-            progressCallback.accept(JobProgressMessage.info(PLATFORM, "开始投递任务..."));
+            progressCallback.accept(JobProgressMessage.info(PLATFORM, direct ? "开始按清单投递..." : "开始投递任务..."));
 
             // 创建并执行 Bean
             Liepin.ProgressCallback cb = (message, current, total) -> {
@@ -84,10 +91,10 @@ public class LiepinJobService implements JobPlatformService {
             liepin.setProgressCallback(cb);
             liepin.setShouldStopCallback(this::shouldStop);
 
-            int deliveredCount = liepin.execute();
+            int deliveredCount = direct ? liepin.executeAllowlist() : liepin.execute();
 
             progressCallback.accept(JobProgressMessage.success(PLATFORM,
-                String.format("投递任务完成，共发起%d个聊天", deliveredCount)));
+                String.format(direct ? "按清单投递完成，共发起%d个聊天" : "投递任务完成，共发起%d个聊天", deliveredCount)));
         } catch (Exception e) {
             log.error("猎聘投递任务执行失败", e);
             progressCallback.accept(JobProgressMessage.error(PLATFORM, "投递失败: " + e.getMessage()));

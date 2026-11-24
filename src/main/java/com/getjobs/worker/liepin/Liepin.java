@@ -2,6 +2,7 @@ package com.getjobs.worker.liepin;
 
 import com.getjobs.worker.utils.PlaywrightUtil;
 import com.getjobs.application.service.LiepinService;
+import com.getjobs.application.service.JobStatusService;
 import com.getjobs.application.entity.LiepinEntity;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -19,10 +20,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 // 移除保存页面源码相关的导入
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 import static com.getjobs.worker.liepin.Locators.*;
@@ -41,15 +45,25 @@ public class Liepin {
         System.setProperty("log.name", "liepin");
     }
 
+    // 正常岗位薪资跨度上限；上限-下限超过这个值就过滤（15-20K 的 5K 保留，12-20K 的 8K 过滤）
+    private static final int MAX_SALARY_SPREAD_K = 6;
     private int maxPage = 50;
     private final List<String> resultList = new ArrayList<>();
-    private final List<LiepinEntity> lastApiEntities = new ArrayList<>();
+    // 每次接口响应构建一个新列表再整体替换，处理线程只读快照，避免 clear/add 与遍历并发
+    private volatile List<LiepinEntity> lastApiEntities = new ArrayList<>();
+    // 新版页面滚动加载会把接口响应换掉；按 jobId 缓存所有批次的实体，避免卡片和接口数据错位
+    private final Map<Long, LiepinEntity> apiEntityCache = new ConcurrentHashMap<>();
     // 本次运行已经打过招呼的 HR，避免同一个 HR 的多个岗位重复发消息
     private final Set<String> greetedHrKeys = new HashSet<>();
+    // 逐岗招呼语：prepare() 时从 greetings.json 加载；空表时回退到 config.sayHi
+    private Map<Long, String> greetings = Collections.emptyMap();
+    // 投递白名单：prepare() 时从 allowlist.json 加载；null 表示不过滤
+    private Set<Long> allowlist = null;
     private boolean monitoringRegistered = false;
-    private String targetCityName;
-    private Integer salaryMinK;
-    private Integer salaryMaxK;
+    // 投递线程写、接口响应的持久化线程读，加 volatile 保证可见性
+    private volatile String targetCityName;
+    private volatile Integer salaryMinK;
+    private volatile Integer salaryMaxK;
     @Setter
     private LiepinConfig config;
     @Getter
@@ -58,6 +72,8 @@ public class Liepin {
     private Page page;
     @Autowired
     private LiepinService liepinService;
+    @Autowired
+    private JobStatusService jobStatusService;
 
     public interface ProgressCallback {
         void onProgress(String message, Integer current, Integer total);
@@ -72,6 +88,8 @@ public class Liepin {
         this.startDate = new Date();
         this.resultList.clear();
         this.greetedHrKeys.clear();
+        this.greetings = GreetingStore.load();
+        this.allowlist = AllowlistStore.load();
 
         // 监控猎聘接口请求与返回，输出被拦截的URL（精确匹配PC搜索相关接口）
         if (page != null && !monitoringRegistered) {
@@ -157,6 +175,102 @@ public class Liepin {
         return resultList.size();
     }
 
+    /**
+     * 按 allowlist 清单直投：不再跑关键词/城市，逐个打开 liepin_data.job_link，
+     * 在详情页找「聊一聊/继续聊/投简历」按钮并投递。
+     * allowlist 文件不存在或为空时直接结束。
+     */
+    public int executeAllowlist() {
+        prepare();
+        Set<Long> ids = allowlist;
+        if (ids == null || ids.isEmpty()) {
+            info("allowlist 未配置或为空，直投结束");
+            return 0;
+        }
+        info("按清单直投，共 {} 个岗位", ids.size());
+        Set<String> appliedGroups = new HashSet<>();
+        for (Long jobId : ids) {
+            if (shouldStop()) {
+                info("收到停止指令，提前结束直投");
+                break;
+            }
+            LiepinEntity entity = liepinService.getById(jobId);
+            if (entity == null || entity.getJobLink() == null || entity.getJobLink().isBlank()) {
+                log.warn("直投跳过：数据库无岗位或缺少 job_link: {}", jobId);
+                continue;
+            }
+            int reapply = config.getReapplyAfterDays() == null ? 1 : config.getReapplyAfterDays();
+            if (liepinService.isRecentlyDelivered(jobId, reapply)) {
+                markStatus(jobId, JobStatusService.Status.applied, "冷却期内已投递");
+                info("直投跳过（{} 天内已投递）: 【{}】的【{}】", reapply, entity.getCompName(), entity.getJobTitle());
+                continue;
+            }
+            if (liepinService.isGroupRecentlyDelivered(entity.getCompName(), entity.getJobTitle(), reapply)) {
+                markStatus(jobId, JobStatusService.Status.skipped, "同公司同岗位已投");
+                info("直投跳过（同公司同岗位已投）: 【{}】的【{}】", entity.getCompName(), entity.getJobTitle());
+                continue;
+            }
+            String groupKey = safeText(entity.getCompName()) + "|" + safeText(entity.getJobTitle());
+            if (appliedGroups.contains(groupKey)) {
+                markStatus(jobId, JobStatusService.Status.skipped, "同公司同岗位本轮已投");
+                info("直投跳过（同公司同岗位本轮已投）: 【{}】的【{}】", entity.getCompName(), entity.getJobTitle());
+                continue;
+            }
+            String hrKey = hrKeyOf(entity);
+            if (Boolean.TRUE.equals(config.getSameHrFilter()) && hrKey != null && greetedHrKeys.contains(hrKey)) {
+                markStatus(jobId, JobStatusService.Status.skipped, "同一 HR 本轮已沟通");
+                info("直投跳过（同一 HR 本轮已沟通）: 【{}】的【{}】", entity.getCompName(), entity.getJobTitle());
+                continue;
+            }
+            Page detailPage = null;
+            try {
+                detailPage = page.context().newPage();
+                detailPage.navigate(entity.getJobLink(), new Page.NavigateOptions()
+                        .setTimeout(20000)
+                        .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
+                PlaywrightUtil.sleep(2);
+                Locator button = null;
+                String buttonText = "";
+                for (int attempt = 0; attempt < 8; attempt++) {
+                    button = findDetailActionButton(detailPage);
+                    if (button != null) {
+                        String t = button.textContent();
+                        if (t != null) buttonText = t.trim();
+                        break;
+                    }
+                    PlaywrightUtil.sleep(1);
+                }
+                if (button == null) {
+                    markStatus(jobId, JobStatusService.Status.failed, "详情页未找到投递按钮");
+                    info("直投跳过（详情页未找到投递按钮）: 【{}】的【{}】", entity.getCompName(), entity.getJobTitle());
+                    continue;
+                }
+                if (Boolean.TRUE.equals(config.getDebugger())) {
+                    markStatus(jobId, JobStatusService.Status.skipped, "调试模式未投递");
+                    info("调试模式：找到按钮但不投递 | 公司：{} | 岗位：{} | 按钮：{}",
+                            entity.getCompName(), entity.getJobTitle(), buttonText);
+                    continue;
+                }
+                boolean applied = applyDirectFromDetailPage(detailPage, button, buttonText, entity);
+                if (applied) {
+                    appliedGroups.add(groupKey);
+                }
+            } catch (Exception e) {
+                markStatus(jobId, JobStatusService.Status.failed, "直投异常: " + e.getMessage());
+                log.warn("直投异常 jobId={}: {}", jobId, e.getMessage());
+            } finally {
+                if (detailPage != null) {
+                    try {
+                        detailPage.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        }
+        info("按清单直投完成，共处理 {} 个", resultList.size());
+        return resultList.size();
+    }
+
     /** 一次搜索的目标城市；code 为空、name 为 null 表示全国/不限 */
     private record CityTarget(String code, String name) {}
 
@@ -173,7 +287,7 @@ public class Liepin {
             if (!cardList.isArray()) {
                 return;
             }
-            lastApiEntities.clear();
+            List<LiepinEntity> parsedEntities = new ArrayList<>();
             for (JsonNode item : cardList) {
                 JsonNode job = item.path("job");
                 JsonNode comp = item.path("comp");
@@ -206,16 +320,19 @@ public class Liepin {
 
                 // 缓存到内存供页面投递显示使用（避免从页面读取文本），这里不按城市过滤，
                 // 保留全部卡片是为了让后面按DOM顺序/jobId匹配卡片时不会错位
-                lastApiEntities.add(entity);
+                parsedEntities.add(entity);
+                apiEntityCache.put(entity.getJobId(), entity);
             }
+            // 整体替换快照：处理线程要么看到旧列表，要么看到完整新列表，不会撞上 clear/add
+            lastApiEntities = parsedEntities;
             // 批量持久化：仅不存在时插入，默认 delivered=0。
             // 猎聘搜索接口的city/dq/salaryCode都是软排序信号而非硬过滤，返回结果会混入外地、规模不对、
             // 薪资完全不搭边的岗位——这些岗位从不会真正进入投递流程，存进库里就是纯垃圾数据，会污染
             // "投递分析"页的统计和列表，所以持久化这一步就过滤掉，而不是等投递时才跳过
-            java.util.List<LiepinEntity> toPersist = lastApiEntities;
+            java.util.List<LiepinEntity> toPersist = parsedEntities;
             if (targetCityName != null || hasCompanyScaleFilter() || hasSalaryFilter()) {
                 toPersist = new java.util.ArrayList<>();
-                for (LiepinEntity e : lastApiEntities) {
+                for (LiepinEntity e : parsedEntities) {
                     boolean cityOk = targetCityName == null
                             || (e.getJobArea() != null && e.getJobArea().startsWith(targetCityName));
                     boolean scaleOk = matchesCompanyScale(e.getCompScale());
@@ -230,6 +347,7 @@ public class Liepin {
             } catch (Exception e) {
                 log.warn("批量保存猎聘岗位数据失败: {}", e.getMessage());
             }
+
         } catch (Exception e) {
             log.warn("解析猎聘JSON失败: {}", e.getMessage());
         }
@@ -288,6 +406,108 @@ public class Liepin {
     }
 
     /**
+     * 补发自定义招呼语。聊天面板先等输入框可见，避免 CHAT_HEADER 刚匹配到容器、
+     * 输入框还没渲染就静默跳过。
+     */
+    private void sendCustomGreeting(Page chatPage, Long jobId, String companyName, String jobName) {
+        if (Boolean.FALSE.equals(config.getSendSayHi())) {
+            log.info("已关闭补发自定义招呼语，仅使用猎聘默认招呼语");
+            return;
+        }
+        String sayHi = jobId == null ? config.getSayHi() : greetings.getOrDefault(jobId, config.getSayHi());
+        if (sayHi == null || sayHi.isBlank()) return;
+        if (jobId != null && greetings.containsKey(jobId)) {
+            log.info("使用逐岗招呼语: jobId={}", jobId);
+        }
+        try {
+            Locator input = chatPage.locator(CHAT_INPUT);
+            try {
+                input.first().waitFor(new Locator.WaitForOptions()
+                        .setState(WaitForSelectorState.VISIBLE).setTimeout(5000));
+            } catch (Exception ignored) {
+                // 个别版本聊天输入不是 textarea.im-ui-textarea，退回聊天容器内的可编辑元素
+                input = chatPage.locator(CHAT_CONTAINER).locator("textarea, [contenteditable='true']");
+                input.first().waitFor(new Locator.WaitForOptions()
+                        .setState(WaitForSelectorState.VISIBLE).setTimeout(3000));
+            }
+            input.first().click();
+            input.first().fill(sayHi);
+            input.first().press("Enter");
+            PlaywrightUtil.sleep(1);
+            info("已补发自定义招呼语: 【{}】的【{}】", companyName, jobName);
+        } catch (Exception e) {
+            log.warn("补发自定义招呼语失败: 【{}】的【{}】: {}", companyName, jobName, e.getMessage());
+        }
+    }
+
+    /**
+     * 直接投递（投简历）不会自动开聊天，若投完后按钮变成「继续聊」，
+     * 进去补发自定义招呼语，再关掉聊天。按钮还是「投简历」时不做任何事，避免重复投递。
+     */
+    private void tryGreetingAfterDirect(Locator button, Long jobId, String companyName, String jobName) {
+        if (!Boolean.TRUE.equals(config.getSendSayHi())) return;
+        try {
+            String text = safeText(button.textContent());
+            if (text == null || !(text.contains("继续聊") || text.contains("聊一聊") || text.contains("立即沟通"))) {
+                return;
+            }
+            int pagesBefore = page.context().pages().size();
+            button.click(new Locator.ClickOptions().setForce(true).setTimeout(5000));
+            PlaywrightUtil.sleep(2);
+            Page chatPage = page;
+            var pages = page.context().pages();
+            if (pages.size() > pagesBefore) {
+                chatPage = pages.get(pages.size() - 1);
+                chatPage.waitForLoadState(com.microsoft.playwright.options.LoadState.LOAD,
+                        new Page.WaitForLoadStateOptions().setTimeout(5000));
+            }
+            chatPage.waitForSelector(CHAT_HEADER, new Page.WaitForSelectorOptions().setTimeout(5000));
+            sendCustomGreeting(chatPage, jobId, companyName, jobName);
+            if (chatPage != page) {
+                chatPage.close();
+            } else {
+                Locator close = chatPage.locator(CHAT_CONTAINER).locator(CHAT_CLOSE);
+                if (close.count() > 0) {
+                    close.first().click(new Locator.ClickOptions().setForce(true));
+                } else {
+                    chatPage.keyboard().press("Escape");
+                }
+            }
+        } catch (Exception e) {
+            log.debug("直投后补发招呼语失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 投递成功后，猎聘偶尔弹「为你推荐以下职位」窗口，右下角是「一键发简历(N)」。
+     * 不做筛选，直接点这个按钮，把这批推荐岗位一起投掉；失败不影响主流程。
+     */
+    private void tryOneClickResume(Page target) {
+        if (target == null || target.isClosed()) return;
+        try {
+            Locator btn = target.locator(ONE_CLICK_RESUME_BTN);
+            if (btn.count() == 0 || !btn.first().isVisible()) {
+                // 弹窗有时比“投递成功”晚半秒出现，只等这一下
+                PlaywrightUtil.sleep(1);
+                btn = target.locator(ONE_CLICK_RESUME_BTN);
+            }
+            if (btn.count() == 0 || !btn.first().isVisible()) return;
+            String text = safeText(btn.first().textContent());
+            btn.first().click(new Locator.ClickOptions().setForce(true).setTimeout(5000));
+            info("一键发简历：已点击 {}", text == null ? "" : text);
+            PlaywrightUtil.sleep(2);
+            // 推荐投递后可能再弹确认框
+            Locator confirm = target.locator("button:has-text('立即投递'), button:has-text('确定')");
+            if (confirm.count() > 0 && confirm.first().isVisible()) {
+                confirm.first().click(new Locator.ClickOptions().setForce(true).setTimeout(5000));
+                PlaywrightUtil.sleep(1);
+            }
+        } catch (Exception e) {
+            log.debug("一键发简历失败: {}", e.getMessage());
+        }
+    }
+
+    /**
      * 关闭「我的沟通」右侧栏（如果出现）。它常驻在卡片右侧，会拦截悬停和点击，
      * 聊天结束后不关会让下一张卡片的按钮点不到。
      */
@@ -306,6 +526,51 @@ public class Liepin {
     }
 
     /**
+     * 直达「投简历」或聊天里的「发简历」都会弹「选择附件简历」确认框，
+     * 有「立即投递」就点掉；返回是否点了确认。
+     */
+    private boolean confirmResumeDialogIfPresent() {
+        return confirmResumeDialogOn(page);
+    }
+
+    private boolean confirmResumeDialogOn(Page target) {
+        try {
+            Locator confirm = target.locator("button:has-text('立即投递')");
+            if (confirm.count() > 0) {
+                confirm.first().waitFor(new Locator.WaitForOptions().setState(WaitForSelectorState.VISIBLE).setTimeout(3000));
+                confirm.first().click(new Locator.ClickOptions().setForce(true).setTimeout(10000));
+                PlaywrightUtil.sleep(1);
+                return true;
+            }
+        } catch (Exception e) {
+            log.warn("确认附件简历弹窗失败: {}", e.getMessage());
+        }
+        return false;
+    }
+
+    /** 关闭残留的附件简历确认弹窗，避免它挡住后续卡片 */
+    private void closeResumeDialogIfPresent() {
+        closeResumeDialogOn(page);
+    }
+
+    private void closeResumeDialogOn(Page target) {
+        try {
+            Locator confirm = target.locator("button:has-text('立即投递')");
+            if (confirm.count() > 0 && confirm.first().isVisible()) {
+                target.keyboard().press("Escape");
+                PlaywrightUtil.sleep(1);
+                if (confirm.count() > 0 && confirm.first().isVisible()) {
+                    Locator close = target.locator(".ant-modal-close, span[aria-label='close']").first();
+                    if (close.count() > 0 && close.isVisible()) {
+                        close.click(new Locator.ClickOptions().setForce(true).setTimeout(3000));
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
      * 在当前卡片里重新找一个可点击的动作按钮。
      * 猎聘的按钮悬停后才显示；抓完详情页回来悬停态会丢，按钮被收起，
      * 旧的 locator 再点就是 30 秒超时。点击前用这个方法重新定位。
@@ -317,8 +582,17 @@ public class Liepin {
             "button[class*='ant-btn'][class*='primary']",
             "button[class*='ant-btn'][class*='round']",
             "button:has-text('聊一聊')",
+            "button:has-text('立即沟通')",
             "button:has-text('投简历')",
-            "button:has-text('继续聊')"
+            "button:has-text('继续聊')",
+            // 岗位详情页的聊一聊/投递入口是 <a>，不是 <button>
+            "a:has-text('聊一聊')",
+            "a:has-text('立即沟通')",
+            "a:has-text('投简历')",
+            "a:has-text('投递简历')",
+            "a:has-text('继续聊')",
+            ".chat-btn-box a",
+            ".chat-btn a"
         };
         for (String selector : selectors) {
             Locator buttons = card.locator(selector);
@@ -326,11 +600,12 @@ public class Liepin {
             for (int j = 0; j < buttonCount; j++) {
                 Locator b = buttons.nth(j);
                 try {
-                    if (!b.isVisible()) continue;
+                    if (!b.isVisible() || !b.isEnabled()) continue;
                     String text = b.textContent();
                     if (text == null) continue;
                     String t = text.trim();
-                    if (t.contains("聊一聊") || t.contains("投简历") || t.contains("投递简历") || t.contains("继续聊")) {
+                    if (t.contains("聊一聊") || t.contains("立即沟通") || t.contains("投简历")
+                            || t.contains("投递简历") || t.contains("继续聊")) {
                         return b;
                     }
                 } catch (Exception ignored) {
@@ -338,6 +613,201 @@ public class Liepin {
             }
         }
         return null;
+    }
+
+    /**
+     * 岗位详情页的动作按钮：优先详情页专用的 .chat-btn，再退回文字匹配。
+     */
+    private Locator findDetailActionButton(Page detailPage) {
+        String[] selectors = {
+            ".chat-btn-box a",
+            ".chat-btn a",
+            "a:has-text('聊一聊')",
+            "a:has-text('继续聊')",
+            "a:has-text('立即沟通')",
+            "a:has-text('投简历')",
+            "a:has-text('投递简历')",
+            "button:has-text('聊一聊')",
+            "button:has-text('继续聊')",
+            "button:has-text('立即沟通')",
+            "button:has-text('投简历')",
+            "button:has-text('投递简历')"
+        };
+        for (String selector : selectors) {
+            Locator buttons = detailPage.locator(selector);
+            int count = buttons.count();
+            for (int i = 0; i < count; i++) {
+                Locator b = buttons.nth(i);
+                try {
+                    if (!b.isVisible() || !b.isEnabled()) continue;
+                    String text = b.textContent();
+                    if (text == null) continue;
+                    String t = text.trim();
+                    if (t.contains("聊一聊") || t.contains("继续聊") || t.contains("立即沟通")
+                            || t.contains("投简历") || t.contains("投递简历")) {
+                        return b;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 按岗位详情页直投。只处理详情页上的动作按钮，不复用搜索卡片的悬停/重定位逻辑。
+     * ponytail: 聊天流程与 submitJob 内的分支重复；等搜索流程稳定后再抽公共方法。
+     */
+    private boolean applyDirectFromDetailPage(Page page, Locator button, String buttonText, LiepinEntity entity) {
+        Long jobId = entity.getJobId();
+        String companyName = safeText(entity.getCompName());
+        String jobName = safeText(entity.getJobTitle());
+        String salary = safeText(entity.getJobSalaryText());
+        String recruiterName = entity.getHrName() == null ? "HR" : safeText(entity.getHrName());
+        if (companyName == null) companyName = "公司";
+        if (jobName == null) jobName = "岗位";
+        if (salary == null) salary = "";
+        String hrKey = hrKeyOf(entity);
+
+        if (buttonText.contains("投简历") || buttonText.contains("投递简历")) {
+            try {
+                button.click(new Locator.ClickOptions().setTimeout(10000).setForce(true));
+                PlaywrightUtil.sleep(1);
+                boolean confirmed = confirmResumeDialogOn(page);
+                if (!confirmed) {
+                    boolean stillOpen = false;
+                    try {
+                        Locator confirm = page.locator("button:has-text('立即投递')");
+                        stillOpen = confirm.count() > 0 && confirm.first().isVisible();
+                    } catch (Exception ignored) {
+                    }
+                    if (stillOpen) {
+                        markStatus(jobId, JobStatusService.Status.failed, "直接投递确认框未处理");
+                        closeResumeDialogOn(page);
+                        return false;
+                    }
+                }
+                liepinService.markDelivered(jobId);
+                markStatus(jobId, JobStatusService.Status.applied, "直接投递成功");
+                if (hrKey != null) greetedHrKeys.add(hrKey);
+                resultList.add(String.format("【%s %s %s %s 】", companyName, jobName, salary, recruiterName));
+                info("投递简历成功: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                tryOneClickResume(page);
+                tryGreetingAfterDirect(button, jobId, companyName, jobName);
+                return true;
+            } catch (Exception e) {
+                markStatus(jobId, JobStatusService.Status.failed, "点击投递按钮失败");
+                log.error("直投点击投递按钮失败: {}", e.getMessage());
+                return false;
+            }
+        }
+
+        if (!(buttonText.contains("聊一聊") || buttonText.contains("立即沟通") || buttonText.contains("继续聊"))) {
+            markStatus(jobId, JobStatusService.Status.skipped, "按钮文本不匹配: " + buttonText);
+            info("直投跳过（按钮文本不匹配）: 【{}】的【{}·{}】岗位，按钮文本: '{}'",
+                    companyName, jobName, salary, buttonText);
+            return false;
+        }
+
+        Page chatPage = page;
+        boolean chatOpened = false;
+        try {
+            int pagesBefore = page.context().pages().size();
+            button.click(new Locator.ClickOptions().setTimeout(10000).setForce(true));
+            PlaywrightUtil.sleep(2);
+            try {
+                var pages = page.context().pages();
+                if (pages.size() > pagesBefore) {
+                    chatPage = pages.get(pages.size() - 1);
+                    chatPage.waitForLoadState(com.microsoft.playwright.options.LoadState.LOAD,
+                            new Page.WaitForLoadStateOptions().setTimeout(5000));
+                }
+            } catch (Exception ignored) {
+            }
+            chatPage.waitForSelector(CHAT_HEADER, new Page.WaitForSelectorOptions().setTimeout(5000));
+            chatOpened = true;
+
+            sendCustomGreeting(chatPage, jobId, companyName, jobName);
+
+            try {
+                Locator resumeBtn = chatPage.locator(RESUME_BTN);
+                if (resumeBtn.count() > 0 && resumeBtn.first().isVisible()) {
+                    resumeBtn.first().click(new Locator.ClickOptions().setForce(true));
+                    PlaywrightUtil.sleep(1);
+                    try {
+                        Locator confirmBtn = chatPage.locator("button:has-text('立即投递')");
+                        if (confirmBtn.count() > 0) {
+                            confirmBtn.first().waitFor(new Locator.WaitForOptions().setTimeout(3000));
+                            confirmBtn.first().click(new Locator.ClickOptions().setForce(true));
+                            PlaywrightUtil.sleep(1);
+                            info("已发送附件简历: 【{}】的【{}】岗位", companyName, jobName);
+                        } else {
+                            log.warn("直投未找到「立即投递」确认按钮: 【{}】的【{}】岗位", companyName, jobName);
+                        }
+                    } catch (Exception e2) {
+                        log.warn("直投点击立即投递失败: {}", e2.getMessage());
+                    }
+                } else {
+                    log.warn("直投未找到「发简历」按钮: 【{}】的【{}】岗位", companyName, jobName);
+                }
+            } catch (Exception e) {
+                log.warn("直投点击发简历失败: {}", e.getMessage());
+            }
+
+            tryOneClickResume(page);
+            if (chatPage != page) tryOneClickResume(chatPage);
+
+            if (chatPage != page) {
+                chatPage.close();
+            } else {
+                Locator close = chatPage.locator(CHAT_CONTAINER).locator(CHAT_CLOSE);
+                if (close.count() > 0) {
+                    PlaywrightUtil.sleep(1);
+                    close.first().click(new Locator.ClickOptions().setForce(true));
+                } else {
+                    chatPage.keyboard().press("Escape");
+                }
+            }
+
+            liepinService.markDelivered(jobId);
+            markStatus(jobId, JobStatusService.Status.applied, "聊天投递成功");
+            if (hrKey != null) greetedHrKeys.add(hrKey);
+            resultList.add(String.format("【%s %s %s %s 】", companyName, jobName, salary, recruiterName));
+            return true;
+        } catch (Exception e) {
+            if (!chatOpened) {
+                markStatus(jobId, JobStatusService.Status.failed, "聊天窗口未打开");
+                String chatUrl = "";
+                try {
+                    chatUrl = chatPage.url();
+                } catch (Exception ignored) {
+                }
+                log.warn("直投聊天窗口未打开: {} - 【{}】的【{}】岗位，页面={}，标签页数={}",
+                        e.getMessage(), companyName, jobName, chatUrl, page.context().pages().size());
+                try {
+                    String shot = System.getProperty("java.io.tmpdir") + java.io.File.separator
+                            + "liepin_direct_chat_fail_" + System.currentTimeMillis() + ".png";
+                    chatPage.screenshot(new Page.ScreenshotOptions().setPath(java.nio.file.Paths.get(shot)));
+                    log.warn("直投聊天失败截图: {}", shot);
+                } catch (Exception ignored) {
+                }
+            } else {
+                log.warn("直投关闭聊天窗口失败，但投递可能已成功: {}", e.getMessage());
+                liepinService.markDelivered(jobId);
+                markStatus(jobId, JobStatusService.Status.applied, "聊天投递可能成功（关闭失败）");
+                if (hrKey != null) greetedHrKeys.add(hrKey);
+                resultList.add(String.format("【%s %s %s %s 】", companyName, jobName, salary, recruiterName));
+                return true;
+            }
+            return false;
+        } finally {
+            if (chatPage != page) {
+                try {
+                    if (!chatPage.isClosed()) chatPage.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
     }
 
     /**
@@ -390,8 +860,13 @@ public class Liepin {
     }
 
     /**
-     * 薪资是否命中筛选：只要岗位薪资区间和配置区间有交集就算命中（而不是要求岗位区间整个落在配置区间内），
-     * 和猎聘自己筛选框的语义一致。未配置筛选、或岗位薪资文本解析不出数字时都视为命中（拿不到信息不赌它不合适，保守放行）
+     * 薪资是否命中：取高不取低 + 低起薪岗位的跨度限制。
+     * 目标 20-30K 时：
+     * - 20-30K、20-40K：下限已经 >=20K，算对上，不做跨度过滤 → 保留
+     * - 15-20K：下限低于 20K，但跨度 5K ≤6K → 保留
+     * - 12-20K：下限低于 20K，跨度 8K >6K → 过滤
+     * - 10-15K：上限不够 20K → 过滤
+     * 未配置筛选、或薪资文本解析不出数字时视为命中（拿不到信息不赌它不合适，保守放行）。
      */
     private boolean matchesSalaryRange(String jobSalaryText) {
         if (!hasSalaryFilter()) return true;
@@ -404,7 +879,12 @@ public class Liepin {
             double jobMax = Double.parseDouble(m.group(2));
             // 有些岗位薪资单位是"元/天"而不是K，数值会大得离谱（几百上千），这种解析不出可靠的K值，保守放行
             if (jobMax > 300) return true;
-            return jobMax >= salaryMinK && jobMin <= salaryMaxK;
+            // 上限必须够到目标下限（取高）
+            if (jobMax < salaryMinK) return false;
+            // 下限已经对上目标下限：不再按跨度过滤（20-30K、20-40K 保留）
+            if (jobMin >= salaryMinK) return true;
+            // 起薪低于目标下限的，正常岗位跨度不超过 6K；12-20K(8K) 过滤
+            return (jobMax - jobMin) <= MAX_SALARY_SPREAD_K;
         } catch (NumberFormatException e) {
             return true;
         }
@@ -417,8 +897,57 @@ public class Liepin {
     /** 公司规模是否命中筛选；未配置筛选时视为全部命中 */
     private boolean matchesCompanyScale(String compScale) {
         if (!hasCompanyScaleFilter()) return true;
-        if (compScale == null || compScale.isEmpty()) return false;
+        // 规模未知不代表规模不符。猎聘对“某知名公司”等匿名岗位会隐藏规模，
+        // 按不符处理会白白漏掉仓储物流经理这类好岗位。
+        if (compScale == null || compScale.isBlank() || "未知".equals(compScale.trim())) return true;
         return config.getCompanyScale().contains(compScale.trim());
+    }
+
+    private void markStatus(Long jobId, JobStatusService.Status stage, String reason) {
+        if (jobId != null) jobStatusService.mark(jobId, stage, reason);
+    }
+
+    private boolean hasTitleExcludeFilter() {
+        return config.getTitleExcludeKeywords() != null && !config.getTitleExcludeKeywords().isEmpty();
+    }
+
+    /** 岗位名称是否命中排除词（不区分大小写，包含即命中） */
+    private boolean matchesTitleExclude(String title) {
+        if (title == null || title.isBlank()) return false;
+        String lower = title.toLowerCase();
+        for (String kw : config.getTitleExcludeKeywords()) {
+            if (kw != null && !kw.isBlank() && lower.contains(kw.trim().toLowerCase())) return true;
+        }
+        return false;
+    }
+
+    private boolean hasRecruiterTypeFilter() {
+        String type = config.getRecruiterType();
+        return type != null && !type.isBlank() && !"all".equalsIgnoreCase(type);
+    }
+
+    /**
+     * 是否猎头岗位：猎聘把猎头的招聘者职位标为「猎头顾问」，另有少量「猎头」「资深顾问(SC)」
+     * 「助理顾问(AC)」等写法；企业端常见 HR/HRBP/招聘/人事。识别不了的空职位按企业处理。
+     */
+    private boolean isHeadhunterTitle(String hrTitle) {
+        if (hrTitle == null) return false;
+        String t = hrTitle.trim();
+        return t.contains("猎头")
+                || t.contains("资深顾问")
+                || t.contains("助理顾问")
+                || t.contains("微猎顾问")
+                || t.contains("顾问(C)")
+                || t.contains("顾问(SC)")
+                || t.contains("顾问(AC)");
+    }
+
+    private boolean matchesRecruiterType(String hrTitle) {
+        boolean headhunter = isHeadhunterTitle(hrTitle);
+        String type = config.getRecruiterType();
+        if ("headhunter".equalsIgnoreCase(type)) return headhunter;
+        if ("enterprise".equalsIgnoreCase(type)) return !headhunter;
+        return true;
     }
 
     /** 发布时间是否命中：多选档位优先；旧配置回退到单阈值 */
@@ -450,6 +979,8 @@ public class Liepin {
     /** 按jobId匹配接口返回的实体（卡片顺序和接口返回顺序可能不一致），匹配不到再退化用下标 */
     private LiepinEntity resolveApiEntity(Long cardJobId, int index) {
         if (cardJobId != null) {
+            LiepinEntity cached = apiEntityCache.get(cardJobId);
+            if (cached != null) return cached;
             for (LiepinEntity e : lastApiEntities) {
                 if (cardJobId.equals(e.getJobId())) return e;
             }
@@ -515,11 +1046,103 @@ public class Liepin {
         }
     }
 
-    private void info(String msg) {
+    private void info(String format, Object... args) {
+        String msg = org.slf4j.helpers.MessageFormatter.arrayFormat(format, args).getMessage();
+        log.info(msg);
         if (progressCallback != null) {
             progressCallback.onProgress(msg, null, null);
-        } else {
-            log.info(msg);
+        }
+    }
+
+    /**
+     * 新版搜索结果没有分页控件：滚动加载全部岗位，逐批处理。
+     * 每批处理完再滚动/点“加载更多”，卡片数连续 3 轮不增长才认为到底。
+     */
+    private void submitAllCards() {
+        int processed = 0;
+        int stable = 0;
+        // 安全上限，防止页面异常时无限滚动
+        int maxRounds = 300;
+        for (int round = 0; round < maxRounds; round++) {
+            if (shouldStop()) {
+                info("收到停止指令，结束全部岗位加载");
+                return;
+            }
+            int count;
+            try {
+                count = page.locator(JOB_CARDS).count();
+            } catch (Exception e) {
+                log.debug("统计岗位卡片失败: {}", e.getMessage());
+                return;
+            }
+            if (count == 0) {
+                info("当前页没有岗位卡片，跳过该关键词城市");
+                return;
+            }
+            if (count > processed) {
+                submitJob(processed);
+                processed = count;
+                stable = 0;
+            } else {
+                stable++;
+            }
+            // 底部出现「已展示全部职位」就是到底了
+            if (allJobsShown()) {
+                info("检测到「已展示全部职位」，结束加载（共 " + processed + " 张卡片）");
+                return;
+            }
+            // 页面异常时兜底：连续 15 轮没有新卡片且没有结束标记，才放弃
+            if (stable >= 15) {
+                log.warn("连续 {} 轮没有新卡片，且未检测到「已展示全部职位」，按当前 {} 张结束", stable, processed);
+                break;
+            }
+
+            // 滚动列表容器和页面，触发无限滚动
+            try {
+                page.evaluate("() => { const b = document.querySelector('.job-list-box'); if (b) { b.scrollTop = b.scrollHeight; } window.scrollTo(0, document.body.scrollHeight); }");
+            } catch (Exception ignored) {
+            }
+            // 有“加载更多”按钮就点一下
+            try {
+                Locator more = page.locator(".job-list-box button:has-text('加载更多'), .job-list-box a:has-text('加载更多'), .job-list-box button:has-text('查看更多')");
+                if (more.count() > 0 && more.first().isVisible()) {
+                    more.first().click(new Locator.ClickOptions().setTimeout(3000).setForce(true));
+                }
+            } catch (Exception ignored) {
+            }
+            page.waitForTimeout(1500);
+
+            int newCount;
+            try {
+                newCount = page.locator(JOB_CARDS).count();
+            } catch (Exception e) {
+                break;
+            }
+            boolean shown = allJobsShown();
+            info("加载全部岗位：已处理 {} 张，滚动后当前 {} 张，已展示全部={}", processed, newCount, shown);
+            if (shown) {
+                info("检测到「已展示全部职位」，结束加载（共 " + processed + " 张卡片）");
+                return;
+            }
+            if (newCount <= processed) {
+                stable++;
+            } else {
+                stable = 0;
+            }
+            if (stable >= 15) {
+                log.warn("连续 {} 轮没有新卡片，且未检测到「已展示全部职位」，按当前 {} 张结束", stable, processed);
+                break;
+            }
+        }
+        info("当前关键词城市全部岗位处理完成，共 " + processed + " 张卡片");
+    }
+
+    /** 列表底部是否出现「已展示全部职位」的到底标记 */
+    private boolean allJobsShown() {
+        try {
+            return page.locator("text=已展示全部职位").count() > 0;
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -534,12 +1157,45 @@ public class Liepin {
         log.info("【诊断】cityCode={}，salary={}，最终搜索URL: {}", city.code(), config.getSalary(), finalUrl);
         page.navigate(finalUrl);
 
-        // 等待分页元素加载
-        page.waitForSelector(PAGINATION_BOX, new Page.WaitForSelectorOptions().setTimeout(10000));
+        // 等待分页元素加载。新版搜索结果页可能懒加载分页或改成无限滚动，
+        // 分页控件不存在时不能直接放弃——页面通常已经渲染出岗位卡片，按单页处理。
+        boolean hasPagination = false;
+        try {
+            page.waitForSelector(PAGINATION_BOX, new Page.WaitForSelectorOptions().setTimeout(5000));
+            hasPagination = true;
+        } catch (Exception e) {
+            // 先滚到底，触发懒加载/分页控件
+            try {
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
+                page.waitForTimeout(1000);
+                page.waitForSelector(PAGINATION_BOX, new Page.WaitForSelectorOptions().setTimeout(5000));
+                hasPagination = true;
+            } catch (Exception e2) {
+                int cards = 0;
+                try {
+                    cards = page.locator(JOB_CARDS).count();
+                } catch (Exception ignored) {
+                }
+                log.warn("未找到分页控件，改为滚动加载全部岗位，当前卡片数: {}", cards);
+                if (cards == 0) {
+                    info("当前页没有岗位卡片，跳过该关键词城市");
+                    return;
+                }
+            }
+        }
         Locator paginationBox = page.locator(PAGINATION_BOX);
         Locator lis = paginationBox.locator("li");
-        setMaxPage(lis);
+        if (hasPagination) {
+            setMaxPage(lis);
+        }
         String cityLabel = city.name() == null ? "" : "·" + city.name();
+
+        // 新版页面没有分页控件：滚动加载并处理全部卡片，而不是只处理第一批 40 个
+        if (!hasPagination) {
+            submitAllCards();
+            info(String.format("【%s%s】关键词投递完成！", cleanKeyword, cityLabel));
+            return;
+        }
 
         for (int i = 0; i < maxPage; i++) {
             if (shouldStop()) {
@@ -635,11 +1291,19 @@ public class Liepin {
     }
 
     private void submitJob() {
+        submitJob(0);
+    }
+
+    /**
+     * 处理当前 DOM 中从 startIndex 开始的岗位卡片。
+     * 新版页面滚动加载时，旧卡片仍保留在 DOM，新增卡片追加在后面，用区间避免重复处理。
+     */
+    private void submitJob(int startIndex) {
         // 获取hr数量
         Locator jobCards = page.locator(JOB_CARDS);
         int count = jobCards.count();
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < count; i++) {
+        for (int i = startIndex; i < count; i++) {
             if (shouldStop()) {
                 info("收到停止指令，结束卡片遍历");
                 return;
@@ -648,6 +1312,7 @@ public class Liepin {
             // 弹窗一旦残留会挡住后面所有卡片的点击，表现为"只投了第一个就没反应了"，故每张卡片处理前都查一次
             closeSubscribePopupIfPresent();
             closeImSidebarIfPresent();
+            closeResumeDialogIfPresent();
             // 获取当前岗位卡片（用于后续操作与缺省展示）
             Locator currentJobCard = page.locator(JOB_CARDS).nth(i);
             Locator hrArea = null;
@@ -668,17 +1333,29 @@ public class Liepin {
                 recruiterName = safeText(apiEntity.getHrName());
                 jobArea = apiEntity.getJobArea();
             }
+            String hrTitle = apiEntity != null ? apiEntity.getHrTitle() : null;
             if (recruiterName == null) recruiterName = "HR";
             if (jobName == null) jobName = "岗位";
             if (companyName == null) companyName = "公司";
             if (salary == null) salary = "";
+            // 流水线状态需要 jobId；后面的过滤器发生在 jobIdForUpdate 赋值之前，先取一份
+            Long stageJobId = apiEntity != null ? apiEntity.getJobId() : cardJobId;
+
+            // 岗位名称排除词：猎聘关键词是软匹配，物流关键词会混入销售岗。
+            // 即使进入投递 Agent 模式，纯销售岗仍是硬底线，不交给分数决定。
+            if (hasTitleExcludeFilter() && matchesTitleExclude(jobName)) {
+                markStatus(stageJobId, JobStatusService.Status.skipped, "岗位名称命中排除词");
+                info("跳过岗位（岗位名称命中排除词）: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                continue;
+            }
 
             // 发布时间过滤：多选档位优先；旧配置回退到 publishWithinDays 单阈值
             Integer publishAge = LiepinTimeUtils.daysSincePublish(
                     apiEntity != null ? apiEntity.getJobPublishTime() : null,
                     LocalDateTime.now());
             if (publishAge != null && !isPublishAllowed(publishAge)) {
-                log.info("跳过岗位（发布 {} 天前，不在允许的发布时间段）: 【{}】的【{}·{}】岗位",
+                markStatus(stageJobId, JobStatusService.Status.skipped, "发布时间不在允许档位");
+                info("跳过岗位（发布 {} 天前，不在允许的发布时间段）: 【{}】的【{}·{}】岗位",
                         publishAge, companyName, jobName, salary);
                 continue;
             }
@@ -686,7 +1363,8 @@ public class Liepin {
             // 猎聘接口city/dq是软过滤，会混入外地岗位，这里按城市名前缀二次过滤；拿不到城市信息时保守跳过，不赌它是本地
             if (targetCityName != null) {
                 if (jobArea == null || !jobArea.startsWith(targetCityName)) {
-                    log.info("跳过岗位（城市不匹配，目标【{}】实际【{}】）: 【{}】的【{}·{}】岗位", targetCityName, jobArea == null ? "未知" : jobArea, companyName, jobName, salary);
+                    markStatus(stageJobId, JobStatusService.Status.skipped, "城市不匹配");
+                    info("跳过岗位（城市不匹配，目标【{}】实际【{}】）: 【{}】的【{}·{}】岗位", targetCityName, jobArea == null ? "未知" : jobArea, companyName, jobName, salary);
                     continue;
                 }
             }
@@ -694,21 +1372,42 @@ public class Liepin {
             // 公司规模筛选：猎聘搜索接口不支持按规模硬过滤，用已抓取到的 compScale 二次校验
             String compScale = apiEntity != null ? apiEntity.getCompScale() : null;
             if (hasCompanyScaleFilter() && !matchesCompanyScale(compScale)) {
-                log.info("跳过岗位（公司规模不匹配，目标【{}】实际【{}】）: 【{}】的【{}·{}】岗位", config.getCompanyScale(), compScale == null ? "未知" : compScale, companyName, jobName, salary);
+                markStatus(stageJobId, JobStatusService.Status.skipped, "公司规模不匹配");
+                info("跳过岗位（公司规模不匹配，目标【{}】实际【{}】）: 【{}】的【{}·{}】岗位", config.getCompanyScale(), compScale == null ? "未知" : compScale, companyName, jobName, salary);
                 continue;
             }
 
             // 薪资筛选：salaryCode同样是软过滤，用抓到的薪资文本二次校验
             if (hasSalaryFilter() && !matchesSalaryRange(salary)) {
-                log.info("跳过岗位（薪资不匹配，目标【{}-{}K】实际【{}】）: 【{}】的【{}】岗位", salaryMinK, salaryMaxK, salary, companyName, jobName);
+                markStatus(stageJobId, JobStatusService.Status.skipped, "薪资不匹配");
+                info("跳过岗位（薪资不匹配，目标【{}-{}K】实际【{}】）: 【{}】的【{}】岗位", salaryMinK, salaryMaxK, salary, companyName, jobName);
+                continue;
+            }
+
+            // 招聘方类型筛选：按招聘者职位区分企业 HR / 猎头顾问
+            if (hasRecruiterTypeFilter() && !matchesRecruiterType(hrTitle)) {
+                markStatus(stageJobId, JobStatusService.Status.skipped, "招聘方类型不匹配");
+                info("跳过岗位（招聘方类型不匹配，目标【{}】实际【{}】）: 【{}】的【{}·{}】岗位",
+                        "headhunter".equalsIgnoreCase(config.getRecruiterType()) ? "猎头" : "企业",
+                        (hrTitle == null || hrTitle.isBlank()) ? "未知" : hrTitle,
+                        companyName, jobName, salary);
                 continue;
             }
 
             Long jobIdForUpdate = apiEntity != null ? apiEntity.getJobId() : cardJobId;
 
-            // 重跑时跳过已经投递过的岗位，避免同一个岗位再发一次招呼语
-            if (jobIdForUpdate != null && liepinService.isDelivered(jobIdForUpdate)) {
-                log.info("跳过岗位（已投递过）: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+            // allowlist：文件存在时，只投白名单里的 job_id；文件不存在时不过滤
+            if (allowlist != null && (jobIdForUpdate == null || !allowlist.contains(jobIdForUpdate))) {
+                markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "不在 allowlist");
+                info("跳过岗位（不在 allowlist）: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                continue;
+            }
+
+            // 重复投递冷却：上次投递后超过 N 天允许再次投递，不再永久跳过
+            int reapplyAfterDays = config.getReapplyAfterDays() == null ? 1 : config.getReapplyAfterDays();
+            if (jobIdForUpdate != null && liepinService.isRecentlyDelivered(jobIdForUpdate, reapplyAfterDays)) {
+                markStatus(jobIdForUpdate, JobStatusService.Status.applied, "冷却期内已投递");
+                info("跳过岗位（{} 天内已投递过）: 【{}】的【{}·{}】岗位", reapplyAfterDays, companyName, jobName, salary);
                 continue;
             }
 
@@ -717,7 +1416,15 @@ public class Liepin {
             if (Boolean.TRUE.equals(config.getSameHrFilter())) {
                 hrKey = hrKeyOf(apiEntity);
                 if (hrKey != null && greetedHrKeys.contains(hrKey)) {
-                    log.info("跳过岗位（同一 HR 已打过招呼）: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                    markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "同一 HR 本轮已沟通");
+                    info("跳过岗位（同一 HR 已打过招呼）: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                    continue;
+                }
+                // 跨天去重：该 HR 最近一次投递还在冷却期内，就不再重复打招呼
+                if (apiEntity != null && liepinService.isHrRecentlyDelivered(
+                        apiEntity.getHrImId(), apiEntity.getHrName(), apiEntity.getCompName(), reapplyAfterDays)) {
+                    markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "该 HR 冷却期内已沟通");
+                    info("跳过岗位（该 HR {} 天内已打过招呼）: 【{}】的【{}·{}】岗位", reapplyAfterDays, companyName, jobName, salary);
                     continue;
                 }
             }
@@ -867,7 +1574,41 @@ public class Liepin {
                 // 不再保存页面源码
                 continue;
             }
-            
+
+            // 新版搜索结果改成左右分栏：卡片本身没有动作按钮，按钮在右侧详情栏。
+            // 卡片上找不到目标按钮时，点一下卡片让详情栏切到该岗位，再在整页找按钮。
+            boolean cardHasTargetButton = button != null && (
+                    buttonText.contains("聊一聊") || buttonText.contains("立即沟通")
+                            || buttonText.contains("投简历") || buttonText.contains("投递简历")
+                            || buttonText.contains("继续聊"));
+            if (!cardHasTargetButton) {
+                try {
+                    currentJobCard.click(new Locator.ClickOptions().setTimeout(5000).setForce(true));
+                    PlaywrightUtil.sleep(1);
+                    Locator pageButton = findActionButton(page.locator("body"));
+                    if (pageButton != null) {
+                        button = pageButton;
+                        String t = button.textContent();
+                        buttonText = t != null ? t.trim() : "";
+                        log.debug("卡片无按钮，已从右侧详情栏找到按钮: '{}'", buttonText);
+                    } else {
+                        List<String> btnTexts = new ArrayList<>();
+                        try {
+                            Locator all = page.locator("button");
+                            int n = Math.min(all.count(), 40);
+                            for (int j = 0; j < n; j++) {
+                                String t = all.nth(j).textContent();
+                                if (t != null && !t.trim().isEmpty()) btnTexts.add(t.trim());
+                            }
+                        } catch (Exception ignored) {
+                        }
+                        log.warn("卡片和详情栏都未找到动作按钮，页面按钮文本: {}", btnTexts);
+                    }
+                } catch (Exception e) {
+                    log.debug("点击卡片查找详情栏按钮失败: {}", e.getMessage());
+                }
+            }
+
             // jobIdForUpdate 已在前面解析（优先接口实体，退化到卡片 DOM 属性）
 
             // 补充详情页字段（岗位描述、HR活跃状态、招聘状态）：列表接口里没有这些字段，
@@ -879,20 +1620,20 @@ public class Liepin {
                         // HR 活跃度过滤：多选档位优先；旧配置回退到 hrActiveWithinDays
                         Integer activeAge = LiepinTimeUtils.daysSinceActive(detail.hrActiveStatus(), LocalDateTime.now());
                         if (activeAge != null && !isHrActiveAllowed(activeAge)) {
-                            log.info("跳过岗位（HR {} 天未活跃，不在允许的活跃档位）: 【{}】的【{}·{}】岗位",
+                            markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "HR 活跃度不在允许档位");
+                            info("跳过岗位（HR {} 天未活跃，不在允许的活跃档位）: 【{}】的【{}·{}】岗位",
                                     activeAge, companyName, jobName, salary);
                             continue;
                         }
 
-                        // 发布时间缺失/解析不出时，用详情页“X天前更新”兜底
-                        Integer detailPublishAge = LiepinTimeUtils.daysSincePublish(apiEntity.getJobPublishTime(), LocalDateTime.now());
-                        if (detailPublishAge == null) {
-                            Integer updateAge = LiepinTimeUtils.daysSinceUpdate(detail.recruitmentStatus(), LocalDateTime.now());
-                            if (updateAge != null && !isPublishAllowed(updateAge)) {
-                                log.info("跳过岗位（详情页显示 {} 天前更新，不在允许的发布时间段）: 【{}】的【{}·{}】岗位",
-                                        updateAge, companyName, jobName, salary);
-                                continue;
-                            }
+                        // 接口的 refreshTime 可能是刷新时间，不一定等于详情页显示的“X月X日更新”。
+                        // 详情页日期是用户实际看到的时间，必须再校验一次，不能只在接口时间缺失时才用。
+                        Integer detailUpdateAge = LiepinTimeUtils.daysSinceUpdate(detail.recruitmentStatus(), LocalDateTime.now());
+                        if (detailUpdateAge != null && !isPublishAllowed(detailUpdateAge)) {
+                            markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "详情页更新时间不在允许档位");
+                            info("跳过岗位（详情页显示 {} 天前更新，不在允许的发布时间段）: 【{}】的【{}·{}】岗位",
+                                    detailUpdateAge, companyName, jobName, salary);
+                            continue;
                         }
 
                         liepinService.updateJobDetail(jobIdForUpdate, detail.jobDescription(), detail.hrActiveStatus(), detail.recruitmentStatus());
@@ -904,7 +1645,8 @@ public class Liepin {
 
             // 调试模式：仅遍历不投递
             if (Boolean.TRUE.equals(config.getDebugger())) {
-                log.info("调试模式：仅遍历岗位，不投递 | 公司：{} | 岗位：{}", companyName, jobName);
+                markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "调试模式未投递");
+                info("调试模式：仅遍历岗位，不投递 | 公司：{} | 岗位：{}", companyName, jobName);
                 continue;
             }
 
@@ -919,6 +1661,10 @@ public class Liepin {
                     log.warn("点击前重新悬停失败: {}", e.getMessage());
                 }
                 Locator refreshed = findActionButton(currentJobCard);
+                if (refreshed == null) {
+                    // 新版左右分栏：按钮不在卡片里，回退到整页详情栏
+                    refreshed = findActionButton(page.locator("body"));
+                }
                 if (refreshed != null) {
                     button = refreshed;
                     try {
@@ -932,8 +1678,8 @@ public class Liepin {
                 }
             }
 
-            // 检查按钮文本并点击
-            if (button != null && buttonText.contains("聊一聊")) {
+            // 检查按钮文本并点击；「继续聊」也走聊天流程，冷却期后可再次发招呼语和简历
+            if (button != null && (buttonText.contains("聊一聊") || buttonText.contains("立即沟通") || buttonText.contains("继续聊"))) {
                 try {
                     // 在点击按钮前进行鼠标微调，先向右移动2像素，再向左移动2像素
                     try {
@@ -964,45 +1710,46 @@ public class Liepin {
                         log.warn("鼠标微调失败，直接点击按钮: {}", moveError.getMessage());
                     }
                     
+                    // 「继续聊」可能开在右侧抽屉、弹窗，或者新标签页。只等当前页的弹窗
+                    // 会把新标签页/抽屉场景误判成“没打开”，岗位白白漏投。
+                    int pagesBefore = page.context().pages().size();
                     button.click(new Locator.ClickOptions().setTimeout(10000).setForce(true));
                     PlaywrightUtil.sleep(2); // 等待聊天面板加载
 
+                    Page chatPage = page;
+                    try {
+                        var pages = page.context().pages();
+                        if (pages.size() > pagesBefore) {
+                            chatPage = pages.get(pages.size() - 1);
+                            chatPage.waitForLoadState(com.microsoft.playwright.options.LoadState.LOAD,
+                                    new Page.WaitForLoadStateOptions().setTimeout(5000));
+                        }
+                    } catch (Exception ignored) {
+                    }
+
                     // 猎聘点击"聊一聊"会自动发送一句系统默认招呼语，这里补发自定义打招呼语，
                     // 再点"发简历"直接投递简历，最后关闭聊天窗口
+                    boolean chatOpened = false;
                     try {
-                        // 等待聊天弹窗加载
-                        page.waitForSelector(CHAT_HEADER, new Page.WaitForSelectorOptions().setTimeout(5000));
+                        // 等待聊天面板加载；没等到就不能算投递成功
+                        chatPage.waitForSelector(CHAT_HEADER, new Page.WaitForSelectorOptions().setTimeout(5000));
+                        chatOpened = true;
 
                         // 补发自定义打招呼语。
                         // 猎聘点「聊一聊」会先发账号里的默认招呼语；如果用户已在猎聘设置过招呼语，
                         // 这里再发 sayHi 就会变成两条，所以用 sendSayHi 开关控制补发。
-                        String sayHi = config.getSayHi();
-                        if (Boolean.FALSE.equals(config.getSendSayHi())) {
-                            log.info("已关闭补发自定义招呼语，仅使用猎聘默认招呼语");
-                        } else if (sayHi != null && !sayHi.isBlank()) {
-                            try {
-                                Locator input = page.locator(CHAT_INPUT);
-                                if (input.count() > 0) {
-                                    input.first().click();
-                                    input.first().fill(sayHi);
-                                    input.first().press("Enter");
-                                    PlaywrightUtil.sleep(1);
-                                }
-                            } catch (Exception e) {
-                                log.warn("补发自定义打招呼语失败: {}", e.getMessage());
-                            }
-                        }
+                        sendCustomGreeting(chatPage, jobIdForUpdate, companyName, jobName);
 
                         // 点击"发简历"直接投递简历（使用猎聘账号里已上传的默认附件简历）
                         try {
-                            Locator resumeBtn = page.locator(RESUME_BTN);
+                            Locator resumeBtn = chatPage.locator(RESUME_BTN);
                             if (resumeBtn.count() > 0 && resumeBtn.first().isVisible()) {
                                 resumeBtn.first().click(new Locator.ClickOptions().setForce(true));
                                 PlaywrightUtil.sleep(1);
                                 // 点击后会弹出"选择附件简历"二次确认框，默认已选中简历，需再点"立即投递"确认
                                 boolean confirmed = false;
                                 try {
-                                    Locator confirmBtn = page.locator("button:has-text('立即投递')");
+                                    Locator confirmBtn = chatPage.locator("button:has-text('立即投递')");
                                     if (confirmBtn.count() > 0) {
                                         confirmBtn.first().waitFor(new Locator.WaitForOptions().setTimeout(3000));
                                         confirmBtn.first().click(new Locator.ClickOptions().setForce(true));
@@ -1013,7 +1760,7 @@ public class Liepin {
                                     log.warn("点击立即投递确认按钮失败: {}", e2.getMessage());
                                 }
                                 if (confirmed) {
-                                    log.info("已发送附件简历: 【{}】的【{}】岗位", companyName, jobName);
+                                    info("已发送附件简历: 【{}】的【{}】岗位", companyName, jobName);
                                 } else {
                                     log.warn("未找到「立即投递」确认按钮，简历可能未发出: 【{}】的【{}】岗位", companyName, jobName);
                                 }
@@ -1024,17 +1771,23 @@ public class Liepin {
                             log.warn("点击发简历按钮失败: {}", e.getMessage());
                         }
 
-                        // 关闭聊天窗口：把关闭按钮限定在聊天弹窗容器内查找，而不是全页面搜——
-                        // span[aria-label='close']在页面上不止聊天弹窗一处会用到，全页面搜到的
-                        // 可能是别的元素，点了没用，真正的聊天弹窗留在页面上挡住后面所有卡片，
-                        // 表现就是"只投了第一个就没反应了"
-                        Locator close = page.locator(CHAT_HEADER).locator(CHAT_CLOSE);
-                        if (close.count() > 0) {
-                            PlaywrightUtil.sleep(1);
-                            close.first().click(new Locator.ClickOptions().setForce(true));
+                        tryOneClickResume(page);
+                        if (chatPage != page) tryOneClickResume(chatPage);
+
+                        // 关闭聊天窗口：新标签页直接关掉；页内弹窗/抽屉才找关闭按钮。
+                        // 关闭按钮限定在聊天容器内查找——span[aria-label='close']在页面上
+                        // 不止聊天弹窗一处会用到，全页面搜到的可能是别的元素，点了没用。
+                        if (chatPage != page) {
+                            chatPage.close();
                         } else {
-                            // 找不到时按Esc兜底，避免弹窗残留
-                            page.keyboard().press("Escape");
+                            Locator close = chatPage.locator(CHAT_CONTAINER).locator(CHAT_CLOSE);
+                            if (close.count() > 0) {
+                                PlaywrightUtil.sleep(1);
+                                close.first().click(new Locator.ClickOptions().setForce(true));
+                            } else {
+                                // 找不到时按Esc兜底，避免弹窗残留
+                                chatPage.keyboard().press("Escape");
+                            }
                         }
 
                         resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
@@ -1043,55 +1796,110 @@ public class Liepin {
                         if (jobIdForUpdate != null) {
                             liepinService.markDelivered(jobIdForUpdate);
                         }
+                        markStatus(jobIdForUpdate, JobStatusService.Status.applied, "聊天投递成功");
                         if (hrKey != null) {
                             greetedHrKeys.add(hrKey);
                         }
 
                     } catch (Exception e) {
-                        log.warn("关闭聊天窗口失败，但投递可能已成功: {}", e.getMessage());
-                        // 即使关闭失败，也认为投递成功
-                        resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
-                        sb.setLength(0);
-                        if (jobIdForUpdate != null) {
-                            liepinService.markDelivered(jobIdForUpdate);
+                        if (!chatOpened) {
+                            markStatus(jobIdForUpdate, JobStatusService.Status.failed, "聊天窗口未打开");
+                            // 聊天窗口没打开，不能标记已投，否则冷却期会把岗位错误跳过
+                            String chatUrl = "";
+                            try {
+                                chatUrl = chatPage.url();
+                            } catch (Exception ignored) {
+                            }
+                            log.warn("聊天窗口未打开，未标记已投（按钮={}）: {} - 【{}】的【{}】岗位，页面={}，标签页数={}",
+                                    buttonText, e.getMessage(), companyName, jobName, chatUrl, page.context().pages().size());
+                            try {
+                                String shot = System.getProperty("java.io.tmpdir") + java.io.File.separator
+                                        + "liepin_chat_fail_" + System.currentTimeMillis() + ".png";
+                                chatPage.screenshot(new Page.ScreenshotOptions().setPath(java.nio.file.Paths.get(shot)));
+                                log.warn("聊天失败截图: {}", shot);
+                            } catch (Exception ignored) {
+                            }
+                        } else {
+                            log.warn("关闭聊天窗口失败，但投递可能已成功: {}", e.getMessage());
+                            // 聊天已打开，按投递成功处理
+                            resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
+                            sb.setLength(0);
+                            if (jobIdForUpdate != null) {
+                                liepinService.markDelivered(jobIdForUpdate);
+                            }
+                            markStatus(jobIdForUpdate, JobStatusService.Status.applied, "聊天投递可能成功（关闭失败）");
+                            if (hrKey != null) {
+                                greetedHrKeys.add(hrKey);
+                            }
                         }
-                        if (hrKey != null) {
-                            greetedHrKeys.add(hrKey);
+                    } finally {
+                        // 新标签页的聊天框用完必须关掉，否则每投一个岗位就多一个标签页
+                        if (chatPage != page) {
+                            try {
+                                if (!chatPage.isClosed()) chatPage.close();
+                            } catch (Exception ignored) {
+                            }
                         }
                     }
 
                 } catch (Exception e) {
+                    markStatus(jobIdForUpdate, JobStatusService.Status.failed, "点击聊天按钮失败");
                     log.error("点击按钮失败: {}", e.getMessage());
                 }
             } else if (button != null && (buttonText.contains("投简历") || buttonText.contains("投递简历"))) {
-                // 直接投递类岗位：点击即完成投递，无聊天窗口需要关闭
+                // 直接投递类岗位：点击后必须先处理「选择附件简历 → 立即投递」确认框，
+                // 不点确认弹窗会一直挡着页面，后面的岗位也会全部失败。
                 try {
                     button.click(new Locator.ClickOptions().setTimeout(10000).setForce(true));
                     PlaywrightUtil.sleep(1);
+                    boolean confirmed = confirmResumeDialogIfPresent();
+                    if (!confirmed) {
+                        boolean dialogStillOpen = false;
+                        try {
+                            Locator confirmBtn = page.locator("button:has-text('立即投递')");
+                            dialogStillOpen = confirmBtn.count() > 0 && confirmBtn.first().isVisible();
+                        } catch (Exception ignored) {
+                        }
+                        if (dialogStillOpen) {
+                            markStatus(jobIdForUpdate, JobStatusService.Status.failed, "直接投递确认框未处理");
+                            log.warn("直接投递确认弹窗未处理，关闭弹窗且不标记已投: 【{}】的【{}】岗位", companyName, jobName);
+                            closeResumeDialogIfPresent();
+                            continue;
+                        }
+                        // 没有弹窗说明该岗位点击即完成投递
+                        confirmed = true;
+                    }
                     resultList.add(sb.append("【").append(companyName).append(" ").append(jobName).append(" ").append(salary).append(" ").append(recruiterName).append(" ").append("】").toString());
                     sb.setLength(0);
                     if (jobIdForUpdate != null) {
                         liepinService.markDelivered(jobIdForUpdate);
                     }
+                    markStatus(jobIdForUpdate, JobStatusService.Status.applied, "直接投递成功");
                     if (hrKey != null) {
                         greetedHrKeys.add(hrKey);
                     }
-                    log.info("投递简历成功: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                    info("投递简历成功: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                    tryOneClickResume(page);
+                    tryGreetingAfterDirect(button, jobIdForUpdate, companyName, jobName);
                 } catch (Exception e) {
+                    markStatus(jobIdForUpdate, JobStatusService.Status.failed, "点击投递按钮失败");
                     log.error("点击投递简历按钮失败: {}", e.getMessage());
                 }
             } else {
                 // 如果按钮是“继续聊”，视为已投递
                 if (button != null && buttonText.contains("继续聊") && jobIdForUpdate != null) {
                     liepinService.markDelivered(jobIdForUpdate);
+                    markStatus(jobIdForUpdate, JobStatusService.Status.applied, "继续聊视为已投递");
                     if (hrKey != null) {
                         greetedHrKeys.add(hrKey);
                     }
                 }
                 if (button != null) {
-                    log.info("跳过岗位（按钮文本不匹配）: 【{}】的【{}·{}】岗位，按钮文本: '{}'", companyName, jobName, salary, buttonText);
+                    markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "按钮文本不匹配: " + buttonText);
+                    info("跳过岗位（按钮文本不匹配）: 【{}】的【{}·{}】岗位，按钮文本: '{}'", companyName, jobName, salary, buttonText);
                 } else {
-                    log.info("跳过岗位（未找到任何按钮）: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
+                    markStatus(jobIdForUpdate, JobStatusService.Status.skipped, "未找到任何投递按钮");
+                    info("跳过岗位（未找到任何按钮）: 【{}】的【{}·{}】岗位", companyName, jobName, salary);
                 }
             }
         }
@@ -1118,7 +1926,12 @@ public class Liepin {
             }
             String scm = card.getAttribute("data-tlg-scm");
             if (scm != null) {
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile("jobId=(\\d+)").matcher(scm);
+                // 新版滚动加载的卡片 data-tlg-scm 里是 cid=2_<jobId>&ctype=...
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile("cid=2_(\\d+)").matcher(scm);
+                if (m.find()) {
+                    return Long.parseLong(m.group(1));
+                }
+                m = java.util.regex.Pattern.compile("jobId=(\\d+)").matcher(scm);
                 if (m.find()) {
                     return Long.parseLong(m.group(1));
                 }

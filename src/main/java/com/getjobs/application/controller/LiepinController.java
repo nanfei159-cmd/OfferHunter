@@ -137,6 +137,16 @@ public class LiepinController {
      */
     @PostMapping("/start")
     public ResponseEntity<Map<String, Object>> startLiepinJob() {
+        return startLiepinJob(false);
+    }
+
+    /** 按 allowlist 清单直投：不跑关键词/城市 */
+    @PostMapping("/start-list")
+    public ResponseEntity<Map<String, Object>> startLiepinListJob() {
+        return startLiepinJob(true);
+    }
+
+    private ResponseEntity<Map<String, Object>> startLiepinJob(boolean direct) {
         Map<String, Object> response = new HashMap<>();
 
         try {
@@ -158,17 +168,24 @@ public class LiepinController {
 
             // 异步启动新任务
             CompletableFuture.runAsync(() -> {
-                liepinJobService.executeDelivery(progressMessage -> {
-                    sendLiepinProgress(progressMessage);
-                    log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
-                });
+                if (direct) {
+                    liepinJobService.executeAllowlist(progressMessage -> {
+                        sendLiepinProgress(progressMessage);
+                        log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
+                    });
+                } else {
+                    liepinJobService.executeDelivery(progressMessage -> {
+                        sendLiepinProgress(progressMessage);
+                        log.info("[{}] {}", progressMessage.getPlatform(), progressMessage.getMessage());
+                    });
+                }
             });
 
             response.put("success", true);
-            response.put("message", "猎聘任务启动成功");
+            response.put("message", direct ? "按清单投递启动成功" : "猎聘任务启动成功");
             response.put("status", "started");
 
-            log.info("通过API启动猎聘任务成功");
+            log.info(direct ? "通过API启动按清单投递成功" : "通过API启动猎聘任务成功");
             return ResponseEntity.ok(response);
 
         } catch (Exception e) {

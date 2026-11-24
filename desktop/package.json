@@ -1,6 +1,6 @@
 {
   "name": "offer-hunter-liepin-desktop",
-  "version": "2.0.3",
+  "version": "2.1.0",
   "private": true,
   "description": "Offer猎手 · 猎聘投递助手桌面版",
   "author": "Offer猎手 contributors",
@@ -28,7 +28,7 @@
     ],
     "extraResources": [
       {
-        "from": "../build/libs/get_jobs-2.0.3.jar",
+        "from": "../build/libs/get_jobs-2.1.0.jar",
         "to": "getjobs.jar"
       },
       {
